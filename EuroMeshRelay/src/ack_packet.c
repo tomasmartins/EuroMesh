@@ -27,7 +27,7 @@ static uint32_t read_u32_le(const uint8_t *buffer)
 
 size_t emesh_ack_payload_size(const emesh_ack_packet_t *ack)
 {
-    size_t size = 1;
+    size_t size = 1 + sizeof(uint16_t);
 
     if (ack == NULL) {
         return 0;
@@ -63,6 +63,8 @@ bool emesh_ack_encode(const emesh_ack_packet_t *ack, uint8_t *buffer, size_t buf
     }
 
     buffer[offset++] = ack->flags;
+    write_u16_le(&buffer[offset], ack->acked_seq);
+    offset += sizeof(uint16_t);
 
     if ((ack->flags & EMESH_ACK_FLAG_RX_TICK_PRESENT) != 0u) {
         write_u32_le(&buffer[offset], ack->rx_tick_ms);
@@ -91,13 +93,15 @@ bool emesh_ack_encode(const emesh_ack_packet_t *ack, uint8_t *buffer, size_t buf
 bool emesh_ack_decode(emesh_ack_packet_t *ack, const uint8_t *buffer, size_t buffer_size, size_t *decoded_size)
 {
     size_t offset = 0;
-    size_t minimum_size = 1;
+    size_t minimum_size = 1 + sizeof(uint16_t);
 
     if (ack == NULL || buffer == NULL || buffer_size < minimum_size) {
         return false;
     }
 
     ack->flags = buffer[offset++];
+    ack->acked_seq = read_u16_le(&buffer[offset]);
+    offset += sizeof(uint16_t);
 
     if ((ack->flags & EMESH_ACK_FLAG_RX_TICK_PRESENT) != 0u) {
         if (buffer_size < offset + sizeof(uint32_t)) {

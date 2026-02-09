@@ -12,9 +12,12 @@ extern "C" {
 #define EMESH_ACK_FLAG_RX_TICK_PRESENT  0x01
 #define EMESH_ACK_FLAG_UTC_PRESENT      0x02
 #define EMESH_ACK_FLAG_PPS_TICK_PRESENT 0x04
+#define EMESH_ACK_FLAG_NAK              0x08
+#define EMESH_ACK_FLAG_ACK_OF_ACK       0x10
 
 typedef struct {
     uint8_t flags;
+    uint16_t acked_seq;
     uint32_t rx_tick_ms;
     uint32_t utc_epoch_s;
     uint16_t utc_epoch_ms;
