@@ -27,6 +27,10 @@ typedef struct {
 } sx1276_packet_header_t;
 
 #define SX1276_PACKET_HEADER_SIZE      13U
+#define SX1276_PACKET_FLAG_ACK_REQUEST 0x01U
+#define SX1276_PACKET_FLAG_ACK_PRESENT 0x02U
+#define SX1276_PACKET_FLAG_NAK         0x04U
+#define SX1276_PACKET_FLAG_TIME_SYNC_REQUEST 0x08U
 #define SX1276_REG_FIFO                0x00
 #define SX1276_REG_OP_MODE             0x01
 #define SX1276_REG_FIFO_ADDR_PTR       0x0D

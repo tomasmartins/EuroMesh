@@ -42,7 +42,10 @@ static uint64_t read_le_u64(const uint8_t *buffer)
         | ((uint64_t)buffer[7] << 56);
 }
 
-static void handle_time_sync_payload(time_sync_t *sync, const uint8_t *payload, uint8_t length)
+static void handle_time_sync_payload(time_sync_t *sync,
+                                     const uint8_t *payload,
+                                     uint8_t length,
+                                     bool sync_requested)
 {
     const uint8_t minimum_length = 1 + 8 + 4;
     uint32_t local_now_ms = HAL_GetTick();
@@ -65,6 +68,10 @@ static void handle_time_sync_payload(time_sync_t *sync, const uint8_t *payload, 
     utc_epoch_ms = read_le_u64(&payload[1]);
     pps_tick_ms = read_le_u32(&payload[9]);
 
+    if (!time_sync_should_accept_sample(sync, sync_requested, local_now_ms, utc_epoch_ms)) {
+        return;
+    }
+
     if (length >= (minimum_length + 4)) {
         rx_tick_ms = read_le_u32(&payload[13]);
         rx_tick_valid = (flags & TIME_SYNC_FLAG_RX_TICK_VALID) != 0U;
@@ -84,8 +91,10 @@ static void handle_received_packet(time_sync_t *sync,
                                    const uint8_t *payload,
                                    uint8_t payload_length)
 {
+    bool sync_requested = (header->flags & SX1276_PACKET_FLAG_TIME_SYNC_REQUEST) != 0U;
+
     if (header->type == PACKET_TYPE_BEACON || header->type == PACKET_TYPE_ACK) {
-        handle_time_sync_payload(sync, payload, payload_length);
+        handle_time_sync_payload(sync, payload, payload_length, sync_requested);
     }
 }
 
@@ -112,7 +121,7 @@ int main(void)
 
     sx1276_init(&radio);
     sx1276_configure_lora(&radio, 869525000U, 0x07, 0x07);
-    time_sync_init(&time_sync);
+    time_sync_init(&time_sync, 300000U, 5000U);
 
     while (1) {
         uint8_t payload_length = 0;
