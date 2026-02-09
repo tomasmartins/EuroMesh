@@ -96,7 +96,7 @@ void sx1276_configure_lora(sx1276_t *radio, uint32_t frequency_hz, uint8_t bandw
 
 HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload)
 {
-    uint8_t header_buffer[16] = {0};
+    uint8_t header_buffer[SX1276_PACKET_HEADER_SIZE] = {0};
     uint8_t total_length = header->length + sizeof(header_buffer);
 
     header_buffer[0] = header->type;
@@ -114,7 +114,18 @@ HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header
     header_buffer[12] = (uint8_t)(header->seq);
     header_buffer[13] = (uint8_t)(header->op >> 8);
     header_buffer[14] = (uint8_t)(header->op);
-    header_buffer[15] = header->length;
+    header_buffer[15] = (uint8_t)(header->utc_epoch_s >> 24);
+    header_buffer[16] = (uint8_t)(header->utc_epoch_s >> 16);
+    header_buffer[17] = (uint8_t)(header->utc_epoch_s >> 8);
+    header_buffer[18] = (uint8_t)(header->utc_epoch_s);
+    header_buffer[19] = (uint8_t)(header->utc_epoch_ms >> 8);
+    header_buffer[20] = (uint8_t)(header->utc_epoch_ms);
+    header_buffer[21] = (uint8_t)(header->pps_tick_ms >> 24);
+    header_buffer[22] = (uint8_t)(header->pps_tick_ms >> 16);
+    header_buffer[23] = (uint8_t)(header->pps_tick_ms >> 8);
+    header_buffer[24] = (uint8_t)(header->pps_tick_ms);
+    header_buffer[25] = header->utc_tick_valid;
+    header_buffer[26] = header->length;
 
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_STDBY_MODE);
     sx1276_write_reg(radio, SX1276_REG_FIFO_TX_BASE_ADDR, 0x00);
@@ -139,7 +150,7 @@ HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header
 
 HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t *header, uint8_t *payload, uint8_t payload_capacity, uint8_t *payload_length)
 {
-    uint8_t header_buffer[16] = {0};
+    uint8_t header_buffer[SX1276_PACKET_HEADER_SIZE] = {0};
     uint8_t available = 0;
 
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_RX_CONTINUOUS_MODE);
@@ -168,7 +179,17 @@ HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t 
         | ((uint32_t)header_buffer[10]);
     header->seq = (uint16_t)((header_buffer[11] << 8) | header_buffer[12]);
     header->op = (uint16_t)((header_buffer[13] << 8) | header_buffer[14]);
-    header->length = header_buffer[15];
+    header->utc_epoch_s = ((uint32_t)header_buffer[15] << 24)
+        | ((uint32_t)header_buffer[16] << 16)
+        | ((uint32_t)header_buffer[17] << 8)
+        | ((uint32_t)header_buffer[18]);
+    header->utc_epoch_ms = (uint16_t)((header_buffer[19] << 8) | header_buffer[20]);
+    header->pps_tick_ms = ((uint32_t)header_buffer[21] << 24)
+        | ((uint32_t)header_buffer[22] << 16)
+        | ((uint32_t)header_buffer[23] << 8)
+        | ((uint32_t)header_buffer[24]);
+    header->utc_tick_valid = header_buffer[25];
+    header->length = header_buffer[26];
 
     if (header->length > payload_capacity) {
         return HAL_ERROR;

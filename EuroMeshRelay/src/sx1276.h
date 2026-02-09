@@ -25,8 +25,20 @@ typedef struct {
     uint32_t dest_id;
     uint16_t seq;
     uint16_t op;
+    uint32_t utc_epoch_s;
+    uint16_t utc_epoch_ms;
+    uint32_t pps_tick_ms;
+    uint8_t utc_tick_valid;
     uint8_t length;
 } sx1276_packet_header_t;
+
+/* Packet header serialization uses big-endian (network byte order).
+ * utc_epoch_s: seconds since UTC epoch.
+ * utc_epoch_ms: sub-second milliseconds (0-999).
+ * pps_tick_ms: HAL_GetTick captured at last PPS (milliseconds).
+ * utc_tick_valid: non-zero when UTC time is synchronized.
+ */
+#define SX1276_PACKET_HEADER_SIZE 27
 
 #define SX1276_REG_FIFO                0x00
 #define SX1276_REG_OP_MODE             0x01
