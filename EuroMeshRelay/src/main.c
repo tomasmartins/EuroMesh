@@ -1,4 +1,5 @@
 #include "stm32f4xx_hal.h"
+#include "csma_mac.h"
 #include "sx1276.h"
 #include "time_sync.h"
 
@@ -17,6 +18,13 @@ static void MX_SPI1_Init(void);
 
 #define PACKET_TYPE_BEACON 0x01
 #define PACKET_TYPE_ACK    0x02
+#define PACKET_TYPE_SUBSCRIPTION 0x03
+
+#define TDMA_SLOT_LENGTH_MS          200U
+#define TDMA_BEACON_SLOT_INDEX       0U
+#define TDMA_SUBSCRIPTION_SLOT_INDEX 1U
+#define TDMA_FRAME_SLOT_COUNT        2U
+#define TDMA_FRAME_LENGTH_MS (TDMA_SLOT_LENGTH_MS * TDMA_FRAME_SLOT_COUNT)
 
 #define TIME_SYNC_FLAG_UTC_VALID     0x01
 #define TIME_SYNC_FLAG_PPS_VALID     0x02
@@ -40,6 +48,63 @@ static uint64_t read_le_u64(const uint8_t *buffer)
         | ((uint64_t)buffer[5] << 40)
         | ((uint64_t)buffer[6] << 48)
         | ((uint64_t)buffer[7] << 56);
+}
+
+static void handle_received_packet(time_sync_t *sync,
+                                   const sx1276_packet_header_t *header,
+                                   const uint8_t *payload,
+                                   uint8_t payload_length);
+
+static uint32_t tdma_frame_start_ms(uint32_t now_ms)
+{
+    uint32_t frames_elapsed = now_ms / TDMA_FRAME_LENGTH_MS;
+
+    return (frames_elapsed + 1U) * TDMA_FRAME_LENGTH_MS;
+}
+
+static void wait_until_ms(uint32_t target_ms)
+{
+    while (HAL_GetTick() < target_ms) {
+        HAL_Delay(1);
+    }
+}
+
+static uint8_t build_beacon_payload(uint8_t *payload, uint8_t capacity)
+{
+    if (capacity < 4U) {
+        return 0;
+    }
+    uint32_t now_ms = HAL_GetTick();
+    payload[0] = (uint8_t)now_ms;
+    payload[1] = (uint8_t)(now_ms >> 8);
+    payload[2] = (uint8_t)(now_ms >> 16);
+    payload[3] = (uint8_t)(now_ms >> 24);
+    return 4U;
+}
+
+static uint8_t build_subscription_payload(uint8_t *payload, uint8_t capacity)
+{
+    if (capacity < 1U) {
+        return 0;
+    }
+    payload[0] = 0x01;
+    return 1U;
+}
+
+static void open_subscription_window(time_sync_t *sync, sx1276_t *radio, uint32_t window_ms)
+{
+    uint32_t start_ms = HAL_GetTick();
+    sx1276_packet_header_t rx_header = {0};
+    uint8_t rx_payload[64] = {0};
+    uint8_t rx_payload_length = 0;
+
+    while ((HAL_GetTick() - start_ms) < window_ms) {
+        if (sx1276_receive_packet(radio, &rx_header, rx_payload, sizeof(rx_payload), &rx_payload_length) == HAL_OK) {
+            handle_received_packet(sync, &rx_header, rx_payload, rx_payload_length);
+        } else {
+            HAL_Delay(1);
+        }
+    }
 }
 
 static void handle_time_sync_payload(time_sync_t *sync, const uint8_t *payload, uint8_t length)
@@ -101,6 +166,7 @@ int main(void)
         .dio0_pin = SX1276_DIO0_PIN,
     };
 
+    csma_mac_t mac = {0};
     time_sync_t time_sync;
     uint8_t payload[64] = {0};
     sx1276_packet_header_t header = {0};
@@ -113,14 +179,31 @@ int main(void)
     sx1276_init(&radio);
     sx1276_configure_lora(&radio, 869525000U, 0x07, 0x07);
     time_sync_init(&time_sync);
+    csma_mac_init(&mac, &radio, 150U, 5U, 20U, 3U);
 
     while (1) {
         uint8_t payload_length = 0;
+        uint32_t frame_start_ms = tdma_frame_start_ms(HAL_GetTick());
+        uint32_t subscription_slot_start_ms = frame_start_ms + (TDMA_SUBSCRIPTION_SLOT_INDEX * TDMA_SLOT_LENGTH_MS);
+
+        payload_length = build_beacon_payload(payload, sizeof(payload));
+        header.type = PACKET_TYPE_BEACON;
+        header.seq++;
+        (void)csma_mac_send_tdma(&mac, &header, payload, payload_length, frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_BEACON_SLOT_INDEX);
+
+        payload_length = build_subscription_payload(payload, sizeof(payload));
+        header.type = PACKET_TYPE_SUBSCRIPTION;
+        header.seq++;
+        if (payload_length > 0U) {
+            (void)csma_mac_send_tdma(&mac, &header, payload, payload_length, frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_SUBSCRIPTION_SLOT_INDEX);
+        } else {
+            wait_until_ms(subscription_slot_start_ms);
+            open_subscription_window(&time_sync, &radio, TDMA_SLOT_LENGTH_MS);
+        }
 
         if (sx1276_receive_packet(&radio, &header, payload, sizeof(payload), &payload_length) == HAL_OK) {
             handle_received_packet(&time_sync, &header, payload, payload_length);
         }
-
         HAL_Delay(10);
     }
 }
