@@ -1,5 +1,6 @@
 #include "stm32f4xx_hal.h"
 #include "sx1276.h"
+#include "time_sync.h"
 
 #define SX1276_NSS_PORT GPIOB
 #define SX1276_NSS_PIN  GPIO_PIN_6
@@ -14,6 +15,80 @@ static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 
+#define PACKET_TYPE_BEACON 0x01
+#define PACKET_TYPE_ACK    0x02
+
+#define TIME_SYNC_FLAG_UTC_VALID     0x01
+#define TIME_SYNC_FLAG_PPS_VALID     0x02
+#define TIME_SYNC_FLAG_RX_TICK_VALID 0x04
+
+static uint32_t read_le_u32(const uint8_t *buffer)
+{
+    return ((uint32_t)buffer[0])
+        | ((uint32_t)buffer[1] << 8)
+        | ((uint32_t)buffer[2] << 16)
+        | ((uint32_t)buffer[3] << 24);
+}
+
+static uint64_t read_le_u64(const uint8_t *buffer)
+{
+    return ((uint64_t)buffer[0])
+        | ((uint64_t)buffer[1] << 8)
+        | ((uint64_t)buffer[2] << 16)
+        | ((uint64_t)buffer[3] << 24)
+        | ((uint64_t)buffer[4] << 32)
+        | ((uint64_t)buffer[5] << 40)
+        | ((uint64_t)buffer[6] << 48)
+        | ((uint64_t)buffer[7] << 56);
+}
+
+static void handle_time_sync_payload(time_sync_t *sync, const uint8_t *payload, uint8_t length)
+{
+    const uint8_t minimum_length = 1 + 8 + 4;
+    uint32_t local_now_ms = HAL_GetTick();
+    uint8_t flags = 0;
+    uint64_t utc_epoch_ms = 0;
+    uint32_t pps_tick_ms = 0;
+    uint32_t rx_tick_ms = 0;
+    bool rx_tick_valid = false;
+    int64_t local_offset_ms = 0;
+
+    if (length < minimum_length) {
+        return;
+    }
+
+    flags = payload[0];
+    if ((flags & TIME_SYNC_FLAG_UTC_VALID) == 0U || (flags & TIME_SYNC_FLAG_PPS_VALID) == 0U) {
+        return;
+    }
+
+    utc_epoch_ms = read_le_u64(&payload[1]);
+    pps_tick_ms = read_le_u32(&payload[9]);
+
+    if (length >= (minimum_length + 4)) {
+        rx_tick_ms = read_le_u32(&payload[13]);
+        rx_tick_valid = (flags & TIME_SYNC_FLAG_RX_TICK_VALID) != 0U;
+    }
+
+    if (rx_tick_valid) {
+        local_offset_ms = (int64_t)utc_epoch_ms - (int64_t)rx_tick_ms;
+    } else {
+        local_offset_ms = (int64_t)utc_epoch_ms - (int64_t)local_now_ms;
+    }
+
+    time_sync_handle_ntp_sample(sync, utc_epoch_ms, pps_tick_ms, local_offset_ms, local_now_ms);
+}
+
+static void handle_received_packet(time_sync_t *sync,
+                                   const sx1276_packet_header_t *header,
+                                   const uint8_t *payload,
+                                   uint8_t payload_length)
+{
+    if (header->type == PACKET_TYPE_BEACON || header->type == PACKET_TYPE_ACK) {
+        handle_time_sync_payload(sync, payload, payload_length);
+    }
+}
+
 int main(void)
 {
     sx1276_t radio = {
@@ -26,6 +101,10 @@ int main(void)
         .dio0_pin = SX1276_DIO0_PIN,
     };
 
+    time_sync_t time_sync;
+    uint8_t payload[64] = {0};
+    sx1276_packet_header_t header = {0};
+
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
@@ -33,9 +112,16 @@ int main(void)
 
     sx1276_init(&radio);
     sx1276_configure_lora(&radio, 869525000U, 0x07, 0x07);
+    time_sync_init(&time_sync);
 
     while (1) {
-        HAL_Delay(1000);
+        uint8_t payload_length = 0;
+
+        if (sx1276_receive_packet(&radio, &header, payload, sizeof(payload), &payload_length) == HAL_OK) {
+            handle_received_packet(&time_sync, &header, payload, payload_length);
+        }
+
+        HAL_Delay(10);
     }
 }
 
