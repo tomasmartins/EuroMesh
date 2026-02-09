@@ -3,6 +3,8 @@
 
 #include "stm32f4xx_hal.h"
 
+#include "emesh_packet_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

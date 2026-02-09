@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "emesh_packet_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

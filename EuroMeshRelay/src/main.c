@@ -2,6 +2,7 @@
 #include "csma_mac.h"
 #include "sx1276.h"
 #include "time_sync.h"
+#include "emesh_packet_types.h"
 
 #define SX1276_NSS_PORT GPIOB
 #define SX1276_NSS_PIN  GPIO_PIN_6
@@ -16,10 +17,6 @@ static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 
-#define PACKET_TYPE_BEACON 0x01
-#define PACKET_TYPE_ACK    0x02
-#define PACKET_TYPE_SUBSCRIPTION 0x03
-
 #define TDMA_SLOT_LENGTH_MS          200U
 #define TDMA_BEACON_SLOT_INDEX       0U
 #define TDMA_SUBSCRIPTION_SLOT_INDEX 1U
@@ -29,6 +26,12 @@ static void MX_SPI1_Init(void);
 #define TIME_SYNC_FLAG_UTC_VALID     0x01
 #define TIME_SYNC_FLAG_PPS_VALID     0x02
 #define TIME_SYNC_FLAG_RX_TICK_VALID 0x04
+#define TIME_SYNC_FLAGS_SIZE_BYTES   1U
+#define TIME_SYNC_UTC_SIZE_BYTES     8U
+#define TIME_SYNC_PPS_SIZE_BYTES     4U
+#define TIME_SYNC_RX_TICK_SIZE_BYTES 4U
+#define TIME_SYNC_TIMEOUT_MS         30000U
+#define TIME_SYNC_MAX_SKEW_MS        2000U
 
 static uint32_t read_le_u32(const uint8_t *buffer)
 {
@@ -71,24 +74,26 @@ static void wait_until_ms(uint32_t target_ms)
 
 static uint8_t build_beacon_payload(uint8_t *payload, uint8_t capacity)
 {
-    if (capacity < 4U) {
+    if (capacity < 5U) {
         return 0;
     }
     uint32_t now_ms = HAL_GetTick();
-    payload[0] = (uint8_t)now_ms;
-    payload[1] = (uint8_t)(now_ms >> 8);
-    payload[2] = (uint8_t)(now_ms >> 16);
-    payload[3] = (uint8_t)(now_ms >> 24);
-    return 4U;
+    payload[0] = EMESH_PACKET_TYPE_BEACON;
+    payload[1] = (uint8_t)now_ms;
+    payload[2] = (uint8_t)(now_ms >> 8);
+    payload[3] = (uint8_t)(now_ms >> 16);
+    payload[4] = (uint8_t)(now_ms >> 24);
+    return 5U;
 }
 
 static uint8_t build_subscription_payload(uint8_t *payload, uint8_t capacity)
 {
-    if (capacity < 1U) {
+    if (capacity < 2U) {
         return 0;
     }
-    payload[0] = 0x01;
-    return 1U;
+    payload[0] = EMESH_PACKET_TYPE_SUBSCRIPTION;
+    payload[1] = 0x01;
+    return 2U;
 }
 
 static void open_subscription_window(time_sync_t *sync, sx1276_t *radio, uint32_t window_ms)
@@ -107,45 +112,80 @@ static void open_subscription_window(time_sync_t *sync, sx1276_t *radio, uint32_
     }
 }
 
-static void handle_time_sync_payload(time_sync_t *sync, const uint8_t *payload, uint8_t length)
+static void handle_time_sync_payload(time_sync_t *sync,
+                                     const uint8_t *payload,
+                                     uint8_t length,
+                                     bool sync_requested)
 {
-    const uint8_t minimum_length = 1 + 8 + 4;
-    uint32_t local_now_ms = HAL_GetTick();
-    uint8_t flags = 0;
-    uint64_t utc_epoch_ms = 0;
-    uint32_t pps_tick_ms = 0;
-    uint32_t rx_tick_ms = 0;
-    bool rx_tick_valid = false;
-    int64_t local_offset_ms = 0;
+    const uint8_t minimum_length = TIME_SYNC_FLAGS_SIZE_BYTES + TIME_SYNC_UTC_SIZE_BYTES + TIME_SYNC_PPS_SIZE_BYTES;
+    uint32_t local_tick_ms = HAL_GetTick();
+    uint8_t sync_flags = 0;
+    uint64_t received_utc_ms = 0;
+    uint32_t received_pps_tick_ms = 0;
+    uint32_t received_rx_tick_ms = 0;
+    bool has_rx_tick = false;
+    int64_t utc_offset_ms = 0;
 
     if (length < minimum_length) {
         return;
     }
 
-    flags = payload[0];
-    if ((flags & TIME_SYNC_FLAG_UTC_VALID) == 0U || (flags & TIME_SYNC_FLAG_PPS_VALID) == 0U) {
+    sync_flags = payload[0];
+    if ((sync_flags & TIME_SYNC_FLAG_UTC_VALID) == 0U || (sync_flags & TIME_SYNC_FLAG_PPS_VALID) == 0U) {
         return;
     }
 
-    utc_epoch_ms = read_le_u64(&payload[1]);
-    pps_tick_ms = read_le_u32(&payload[9]);
+    received_utc_ms = read_le_u64(&payload[TIME_SYNC_FLAGS_SIZE_BYTES]);
+    received_pps_tick_ms = read_le_u32(&payload[TIME_SYNC_FLAGS_SIZE_BYTES + TIME_SYNC_UTC_SIZE_BYTES]);
 
-    if (!time_sync_should_accept_sample(sync, sync_requested, local_now_ms, utc_epoch_ms)) {
+    if (!time_sync_should_accept_sample(sync, sync_requested, local_tick_ms, received_utc_ms)) {
         return;
     }
 
     if (length >= (minimum_length + 4)) {
-        rx_tick_ms = read_le_u32(&payload[13]);
-        rx_tick_valid = (flags & TIME_SYNC_FLAG_RX_TICK_VALID) != 0U;
+        received_rx_tick_ms = read_le_u32(&payload[TIME_SYNC_FLAGS_SIZE_BYTES + TIME_SYNC_UTC_SIZE_BYTES + TIME_SYNC_PPS_SIZE_BYTES]);
+        has_rx_tick = (sync_flags & TIME_SYNC_FLAG_RX_TICK_VALID) != 0U;
     }
 
-    if (rx_tick_valid) {
-        local_offset_ms = (int64_t)utc_epoch_ms - (int64_t)rx_tick_ms;
+    if (has_rx_tick) {
+        utc_offset_ms = (int64_t)received_utc_ms - (int64_t)received_rx_tick_ms;
     } else {
-        local_offset_ms = (int64_t)utc_epoch_ms - (int64_t)local_now_ms;
+        utc_offset_ms = (int64_t)received_utc_ms - (int64_t)local_tick_ms;
     }
 
-    time_sync_handle_ntp_sample(sync, utc_epoch_ms, pps_tick_ms, local_offset_ms, local_now_ms);
+    time_sync_handle_ntp_sample(sync, received_utc_ms, received_pps_tick_ms, utc_offset_ms, local_tick_ms);
+}
+
+static bool subscription_is_unique_node(uint32_t node_id)
+{
+    (void)node_id;
+    return true;
+}
+
+static bool subscription_is_location_valid(const uint8_t *payload, uint8_t length)
+{
+    (void)payload;
+    (void)length;
+    /* TODO: Validate location against last known fix (e.g., reject >100 km movement in 1 second). */
+    return true;
+}
+
+static void handle_subscription_packet(const sx1276_packet_header_t *header,
+                                       const uint8_t *payload,
+                                       uint8_t payload_length)
+{
+    if (payload_length <= 1U) {
+        return;
+    }
+    const uint8_t *subscription_payload = &payload[1];
+    uint8_t subscription_length = (uint8_t)(payload_length - 1U);
+    if (!subscription_is_unique_node(header->src_id)) {
+        return;
+    }
+    if (!subscription_is_location_valid(subscription_payload, subscription_length)) {
+        return;
+    }
+    /* TODO: Assign TDMA slot once uniqueness and location validity are confirmed. */
 }
 
 static void handle_received_packet(time_sync_t *sync,
@@ -153,10 +193,20 @@ static void handle_received_packet(time_sync_t *sync,
                                    const uint8_t *payload,
                                    uint8_t payload_length)
 {
+    if (payload_length == 0U) {
+        return;
+    }
+    uint8_t packet_type = payload[0];
     bool sync_requested = (header->flags & SX1276_PACKET_FLAG_TIME_SYNC_REQUEST) != 0U;
 
-    if (header->type == PACKET_TYPE_BEACON || header->type == PACKET_TYPE_ACK) {
-        handle_time_sync_payload(sync, payload, payload_length, sync_requested);
+    if (header->type != packet_type) {
+        return;
+    }
+
+    if (packet_type == EMESH_PACKET_TYPE_BEACON || packet_type == EMESH_PACKET_TYPE_ACK) {
+        handle_time_sync_payload(sync, &payload[1], payload_length - 1U, sync_requested);
+    } else if (packet_type == EMESH_PACKET_TYPE_SUBSCRIPTION) {
+        handle_subscription_packet(header, payload, payload_length);
     }
 }
 
@@ -184,7 +234,7 @@ int main(void)
 
     sx1276_init(&radio);
     sx1276_configure_lora(&radio, 869525000U, 0x07, 0x07);
-    time_sync_init(&time_sync);
+    time_sync_init(&time_sync, TIME_SYNC_TIMEOUT_MS, TIME_SYNC_MAX_SKEW_MS);
     csma_mac_init(&mac, &radio, 150U, 5U, 20U, 3U);
 
     while (1) {
@@ -193,12 +243,12 @@ int main(void)
         uint32_t subscription_slot_start_ms = frame_start_ms + (TDMA_SUBSCRIPTION_SLOT_INDEX * TDMA_SLOT_LENGTH_MS);
 
         payload_length = build_beacon_payload(payload, sizeof(payload));
-        header.type = PACKET_TYPE_BEACON;
+        header.type = EMESH_PACKET_TYPE_BEACON;
         header.seq++;
         (void)csma_mac_send_tdma(&mac, &header, payload, payload_length, frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_BEACON_SLOT_INDEX);
 
         payload_length = build_subscription_payload(payload, sizeof(payload));
-        header.type = PACKET_TYPE_SUBSCRIPTION;
+        header.type = EMESH_PACKET_TYPE_SUBSCRIPTION;
         header.seq++;
         if (payload_length > 0U) {
             (void)csma_mac_send_tdma(&mac, &header, payload, payload_length, frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_SUBSCRIPTION_SLOT_INDEX);

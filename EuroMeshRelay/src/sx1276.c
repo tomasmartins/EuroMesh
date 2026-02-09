@@ -149,6 +149,7 @@ HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t 
     sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, sx1276_read_reg(radio, SX1276_REG_FIFO_RX_CURRENT));
     available = sx1276_read_reg(radio, SX1276_REG_RX_NB_BYTES);
     if (available < sizeof(header_buffer)) {
+        sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, 0x00);
         return HAL_ERROR;
     }
 
@@ -168,6 +169,7 @@ HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t 
     payload_size = (uint8_t)(available - (uint8_t)sizeof(header_buffer));
 
     if (payload_size > payload_capacity) {
+        sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, 0x00);
         return HAL_ERROR;
     }
 

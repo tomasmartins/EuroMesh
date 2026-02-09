@@ -22,12 +22,12 @@ typedef struct {
 void time_sync_init(time_sync_t *sync, uint32_t sync_timeout_ms, uint32_t max_clock_skew_ms);
 bool time_sync_should_accept_sample(const time_sync_t *sync,
                                     bool sync_requested,
-                                    uint32_t local_now_ms,
-                                    uint64_t utc_epoch_ms);
+                                    uint32_t local_tick_ms,
+                                    uint64_t received_utc_ms);
 void time_sync_handle_ntp_sample(time_sync_t *sync,
                                  uint64_t utc_epoch_ms,
                                  uint32_t pps_tick_ms,
-                                 int64_t local_offset_ms,
+                                 int64_t utc_offset_ms,
                                  uint32_t update_tick_ms);
 
 #ifdef __cplusplus
