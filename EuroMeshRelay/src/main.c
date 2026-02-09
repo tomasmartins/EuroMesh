@@ -130,6 +130,10 @@ static void handle_time_sync_payload(time_sync_t *sync, const uint8_t *payload, 
     utc_epoch_ms = read_le_u64(&payload[1]);
     pps_tick_ms = read_le_u32(&payload[9]);
 
+    if (!time_sync_should_accept_sample(sync, sync_requested, local_now_ms, utc_epoch_ms)) {
+        return;
+    }
+
     if (length >= (minimum_length + 4)) {
         rx_tick_ms = read_le_u32(&payload[13]);
         rx_tick_valid = (flags & TIME_SYNC_FLAG_RX_TICK_VALID) != 0U;
@@ -149,8 +153,10 @@ static void handle_received_packet(time_sync_t *sync,
                                    const uint8_t *payload,
                                    uint8_t payload_length)
 {
+    bool sync_requested = (header->flags & SX1276_PACKET_FLAG_TIME_SYNC_REQUEST) != 0U;
+
     if (header->type == PACKET_TYPE_BEACON || header->type == PACKET_TYPE_ACK) {
-        handle_time_sync_payload(sync, payload, payload_length);
+        handle_time_sync_payload(sync, payload, payload_length, sync_requested);
     }
 }
 

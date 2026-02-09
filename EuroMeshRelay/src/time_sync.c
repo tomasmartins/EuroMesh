@@ -2,56 +2,63 @@
 
 #include <string.h>
 
-void time_sync_init(time_sync_t *sync)
+static uint32_t time_sync_abs_delta_ms(uint64_t utc_epoch_ms, uint32_t local_now_ms, int64_t offset_ms)
+{
+    int64_t local_time_ms = (int64_t)local_now_ms + offset_ms;
+    int64_t delta_ms = (int64_t)utc_epoch_ms - local_time_ms;
+
+    if (delta_ms < 0) {
+        delta_ms = -delta_ms;
+    }
+
+    if (delta_ms > (int64_t)UINT32_MAX) {
+        return UINT32_MAX;
+    }
+
+    return (uint32_t)delta_ms;
+}
+
+void time_sync_init(time_sync_t *sync, uint32_t sync_timeout_ms, uint32_t max_clock_skew_ms)
 {
     if (sync == NULL) {
         return;
     }
-    sync->hrtc = hrtc;
-    sync->offset_ms = 0;
-    sync->last_rtc_ms = 0;
-    sync->last_tick_ms = HAL_GetTick();
-}
-
-uint32_t time_sync_now_ms(const time_sync_t *sync)
-{
-    if (sync == NULL) {
-        return HAL_GetTick();
-    }
-    return (uint32_t)((int32_t)HAL_GetTick() + sync->offset_ms);
-}
-
-HAL_StatusTypeDef time_sync_handle_ntp_sample(time_sync_t *sync, uint32_t t1_ms, uint32_t t2_ms, uint32_t t3_ms, uint32_t t4_ms)
-{
-    int32_t offset = 0;
-
-    if (sync == NULL) {
-        return HAL_ERROR;
-    }
-
-    offset = (int32_t)(((int32_t)(t2_ms - t1_ms) + (int32_t)(t3_ms - t4_ms)) / 2);
-    sync->offset_ms = offset;
-    sync->last_tick_ms = HAL_GetTick();
-    return HAL_OK;
-}
-
-HAL_StatusTypeDef time_sync_handle_pps(time_sync_t *sync, uint32_t pps_tick_ms)
-{
-    uint32_t rtc_ms = 0;
-
-    if (sync == NULL) {
-        return HAL_ERROR;
-    }
-    if (time_sync_read_rtc_ms(sync, &rtc_ms) != HAL_OK) {
-        return HAL_ERROR;
-    }
-
-    sync->offset_ms = (int32_t)rtc_ms - (int32_t)pps_tick_ms;
-    sync->last_rtc_ms = rtc_ms;
-    sync->last_tick_ms = pps_tick_ms;
-    return HAL_OK;
 
     memset(sync, 0, sizeof(*sync));
+    sync->sync_timeout_ms = sync_timeout_ms;
+    sync->max_clock_skew_ms = max_clock_skew_ms;
+}
+
+bool time_sync_should_accept_sample(const time_sync_t *sync,
+                                    bool sync_requested,
+                                    uint32_t local_now_ms,
+                                    uint64_t utc_epoch_ms)
+{
+    uint32_t delta_ms = 0;
+
+    if (sync == NULL) {
+        return false;
+    }
+
+    if (sync_requested || !sync->utc_valid) {
+        return true;
+    }
+
+    if (sync->sync_timeout_ms > 0U) {
+        uint32_t elapsed = local_now_ms - sync->last_update_tick_ms;
+        if (elapsed >= sync->sync_timeout_ms) {
+            return true;
+        }
+    }
+
+    if (sync->max_clock_skew_ms > 0U && utc_epoch_ms > 0U) {
+        delta_ms = time_sync_abs_delta_ms(utc_epoch_ms, local_now_ms, sync->utc_offset_ms);
+        if (delta_ms >= sync->max_clock_skew_ms) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void time_sync_handle_ntp_sample(time_sync_t *sync,
