@@ -24,22 +24,9 @@ typedef struct {
     uint32_t src_id;
     uint32_t dest_id;
     uint16_t seq;
-    uint16_t op;
-    uint32_t utc_epoch_s;
-    uint16_t utc_epoch_ms;
-    uint32_t pps_tick_ms;
-    uint8_t utc_tick_valid;
-    uint8_t length;
 } sx1276_packet_header_t;
 
-/* Packet header serialization uses big-endian (network byte order).
- * utc_epoch_s: seconds since UTC epoch.
- * utc_epoch_ms: sub-second milliseconds (0-999).
- * pps_tick_ms: HAL_GetTick captured at last PPS (milliseconds).
- * utc_tick_valid: non-zero when UTC time is synchronized.
- */
-#define SX1276_PACKET_HEADER_SIZE 27
-
+#define SX1276_PACKET_HEADER_SIZE      13U
 #define SX1276_REG_FIFO                0x00
 #define SX1276_REG_OP_MODE             0x01
 #define SX1276_REG_FIFO_ADDR_PTR       0x0D
@@ -59,6 +46,7 @@ typedef struct {
 #define SX1276_REG_PAYLOAD_LENGTH      0x22
 #define SX1276_REG_RX_NB_BYTES         0x13
 #define SX1276_REG_IRQ_FLAGS           0x12
+#define SX1276_REG_RSSI_VALUE          0x1B
 
 #define SX1276_LONG_RANGE_MODE         0x80
 #define SX1276_SLEEP_MODE              0x00
@@ -77,7 +65,7 @@ void sx1276_read_burst(sx1276_t *radio, uint8_t addr, uint8_t *buffer, uint8_t l
 void sx1276_write_burst(sx1276_t *radio, uint8_t addr, const uint8_t *buffer, uint8_t length);
 void sx1276_set_frequency(sx1276_t *radio, uint32_t frequency_hz);
 void sx1276_configure_lora(sx1276_t *radio, uint32_t frequency_hz, uint8_t bandwidth_bits, uint8_t spreading_factor);
-HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload);
+HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload, uint8_t payload_length);
 HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t *header, uint8_t *payload, uint8_t payload_capacity, uint8_t *payload_length);
 
 #ifdef __cplusplus
