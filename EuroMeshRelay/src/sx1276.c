@@ -94,10 +94,10 @@ void sx1276_configure_lora(sx1276_t *radio, uint32_t frequency_hz, uint8_t bandw
     sx1276_write_reg(radio, SX1276_REG_SYMB_TIMEOUT_LSB, 0x08);
 }
 
-HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload)
+HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload, uint8_t payload_length)
 {
-    uint8_t header_buffer[16] = {0};
-    uint8_t total_length = header->length + sizeof(header_buffer);
+    uint8_t header_buffer[SX1276_PACKET_HEADER_SIZE] = {0};
+    uint8_t total_length = payload_length + (uint8_t)sizeof(header_buffer);
 
     header_buffer[0] = header->type;
     header_buffer[1] = header->flags;
@@ -112,16 +112,13 @@ HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header
     header_buffer[10] = (uint8_t)(header->dest_id);
     header_buffer[11] = (uint8_t)(header->seq >> 8);
     header_buffer[12] = (uint8_t)(header->seq);
-    header_buffer[13] = (uint8_t)(header->op >> 8);
-    header_buffer[14] = (uint8_t)(header->op);
-    header_buffer[15] = header->length;
 
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_STDBY_MODE);
     sx1276_write_reg(radio, SX1276_REG_FIFO_TX_BASE_ADDR, 0x00);
     sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, 0x00);
     sx1276_write_burst(radio, SX1276_REG_FIFO, header_buffer, sizeof(header_buffer));
-    if (header->length > 0) {
-        sx1276_write_burst(radio, SX1276_REG_FIFO, payload, header->length);
+    if (payload_length > 0U) {
+        sx1276_write_burst(radio, SX1276_REG_FIFO, payload, payload_length);
     }
     sx1276_write_reg(radio, SX1276_REG_PAYLOAD_LENGTH, total_length);
     sx1276_write_reg(radio, SX1276_REG_IRQ_FLAGS, SX1276_IRQ_TX_DONE);
@@ -139,8 +136,9 @@ HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header
 
 HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t *header, uint8_t *payload, uint8_t payload_capacity, uint8_t *payload_length)
 {
-    uint8_t header_buffer[16] = {0};
+    uint8_t header_buffer[SX1276_PACKET_HEADER_SIZE] = {0};
     uint8_t available = 0;
+    uint8_t payload_size = 0;
 
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_RX_CONTINUOUS_MODE);
     if ((sx1276_read_reg(radio, SX1276_REG_IRQ_FLAGS) & SX1276_IRQ_RX_DONE) == 0U) {
@@ -167,18 +165,17 @@ HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t 
         | ((uint32_t)header_buffer[9] << 8)
         | ((uint32_t)header_buffer[10]);
     header->seq = (uint16_t)((header_buffer[11] << 8) | header_buffer[12]);
-    header->op = (uint16_t)((header_buffer[13] << 8) | header_buffer[14]);
-    header->length = header_buffer[15];
+    payload_size = (uint8_t)(available - (uint8_t)sizeof(header_buffer));
 
-    if (header->length > payload_capacity) {
+    if (payload_size > payload_capacity) {
         return HAL_ERROR;
     }
 
-    if (header->length > 0U) {
-        sx1276_read_burst(radio, SX1276_REG_FIFO, payload, header->length);
+    if (payload_size > 0U) {
+        sx1276_read_burst(radio, SX1276_REG_FIFO, payload, payload_size);
     }
     if (payload_length != NULL) {
-        *payload_length = header->length;
+        *payload_length = payload_size;
     }
     return HAL_OK;
 }
