@@ -1,9 +1,9 @@
 #ifndef SX1276_H
 #define SX1276_H
 
-#include "stm32f4xx_hal.h"
+#include <stdbool.h>
 
-#include "emesh_packet_types.h"
+#include "stm32f4xx_hal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,20 +19,6 @@ typedef struct {
     uint16_t dio0_pin;
 } sx1276_t;
 
-typedef struct {
-    uint8_t type;
-    uint8_t flags;
-    uint8_t ttl;
-    uint32_t src_id;
-    uint32_t dest_id;
-    uint16_t seq;
-} sx1276_packet_header_t;
-
-#define SX1276_PACKET_HEADER_SIZE      13U
-#define SX1276_PACKET_FLAG_ACK_REQUEST 0x01U
-#define SX1276_PACKET_FLAG_ACK_PRESENT 0x02U
-#define SX1276_PACKET_FLAG_NAK         0x04U
-#define SX1276_PACKET_FLAG_TIME_SYNC_REQUEST 0x08U
 #define SX1276_REG_FIFO                0x00
 #define SX1276_REG_OP_MODE             0x01
 #define SX1276_REG_FIFO_ADDR_PTR       0x0D
@@ -52,7 +38,10 @@ typedef struct {
 #define SX1276_REG_PAYLOAD_LENGTH      0x22
 #define SX1276_REG_RX_NB_BYTES         0x13
 #define SX1276_REG_IRQ_FLAGS           0x12
+#define SX1276_REG_PKT_SNR_VALUE       0x19
+#define SX1276_REG_PKT_RSSI_VALUE      0x1A
 #define SX1276_REG_RSSI_VALUE          0x1B
+#define SX1276_REG_DIO_MAPPING_1       0x40
 
 #define SX1276_LONG_RANGE_MODE         0x80
 #define SX1276_SLEEP_MODE              0x00
@@ -62,6 +51,25 @@ typedef struct {
 
 #define SX1276_IRQ_TX_DONE             0x08
 #define SX1276_IRQ_RX_DONE             0x40
+#define SX1276_IRQ_PAYLOAD_CRC_ERROR   0x20
+
+typedef struct {
+    uint32_t frequency_hz;
+    uint8_t bandwidth_bits;
+    uint8_t spreading_factor;
+    uint8_t coding_rate_bits;
+    int8_t tx_power_dbm;
+    bool implicit_header_mode;
+} sx1276_lora_config_t;
+
+typedef struct {
+    int16_t rssi_dbm;
+    int8_t snr_db;
+    uint32_t timestamp_ms;
+    bool crc_ok;
+    bool implicit_header_mode;
+    uint8_t irq_flags;
+} sx1276_rx_metadata_t;
 
 void sx1276_init(sx1276_t *radio);
 void sx1276_reset(sx1276_t *radio);
@@ -70,9 +78,10 @@ void sx1276_write_reg(sx1276_t *radio, uint8_t addr, uint8_t value);
 void sx1276_read_burst(sx1276_t *radio, uint8_t addr, uint8_t *buffer, uint8_t length);
 void sx1276_write_burst(sx1276_t *radio, uint8_t addr, const uint8_t *buffer, uint8_t length);
 void sx1276_set_frequency(sx1276_t *radio, uint32_t frequency_hz);
-void sx1276_configure_lora(sx1276_t *radio, uint32_t frequency_hz, uint8_t bandwidth_bits, uint8_t spreading_factor);
-HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload, uint8_t payload_length);
-HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t *header, uint8_t *payload, uint8_t payload_capacity, uint8_t *payload_length);
+void sx1276_configure_lora(sx1276_t *radio, const sx1276_lora_config_t *config);
+void sx1276_set_irq_mapping(sx1276_t *radio, uint8_t dio0_mapping_bits);
+HAL_StatusTypeDef sx1276_send_bytes(sx1276_t *radio, const uint8_t *data, uint8_t data_length, uint32_t timeout_ms);
+HAL_StatusTypeDef sx1276_receive_bytes(sx1276_t *radio, uint8_t *buffer, uint8_t buffer_capacity, uint8_t *received_length, sx1276_rx_metadata_t *metadata);
 
 #ifdef __cplusplus
 }

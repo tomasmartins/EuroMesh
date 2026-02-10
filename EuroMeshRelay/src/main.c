@@ -1,6 +1,7 @@
 #include "stm32f4xx_hal.h"
 #include "csma_mac.h"
 #include "sx1276.h"
+#include "emesh_frame.h"
 #include "tdma.h"
 #include "time_sync.h"
 #include "nodes.h"
@@ -20,7 +21,7 @@ static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 
 static void handle_received_packet(time_sync_t *sync,
-                                   const sx1276_packet_header_t *header,
+                                   const emesh_frame_header_t *header,
                                    const uint8_t *payload,
                                    uint8_t payload_length);
 
@@ -46,7 +47,7 @@ static uint8_t build_beacon_payload(uint8_t *payload, uint8_t capacity)
 }
 
 static void handle_received_packet(time_sync_t *sync,
-                                   const sx1276_packet_header_t *header,
+                                   const emesh_frame_header_t *header,
                                    const uint8_t *payload,
                                    uint8_t payload_length)
 {
@@ -54,7 +55,7 @@ static void handle_received_packet(time_sync_t *sync,
         return;
     }
     uint8_t packet_type = payload[0];
-    bool sync_requested = (header->flags & SX1276_PACKET_FLAG_TIME_SYNC_REQUEST) != 0U;
+    bool sync_requested = (header->flags & EMESH_FRAME_FLAG_TIME_SYNC_REQUEST) != 0U;
 
     if (header->type != packet_type) {
         return;
@@ -82,7 +83,7 @@ int main(void)
     csma_mac_t mac = {0};
     time_sync_t time_sync;
     uint8_t payload[64] = {0};
-    sx1276_packet_header_t header = {0};
+    emesh_frame_header_t header = {0};
 
     HAL_Init();
     SystemClock_Config();
@@ -90,7 +91,16 @@ int main(void)
     MX_SPI1_Init();
 
     sx1276_init(&radio);
-    sx1276_configure_lora(&radio, 869525000U, 0x07, 0x07);
+    sx1276_lora_config_t radio_config = {
+        .frequency_hz = 869525000U,
+        .bandwidth_bits = 0x07,
+        .spreading_factor = 0x07,
+        .coding_rate_bits = 0x01,
+        .tx_power_dbm = 15,
+        .implicit_header_mode = false,
+    };
+
+    sx1276_configure_lora(&radio, &radio_config);
     time_sync_init(&time_sync, TIME_SYNC_TIMEOUT_MS, TIME_SYNC_MAX_SKEW_MS);
     csma_mac_init(&mac, &radio, 150U, 5U, 20U, 3U);
 
@@ -114,8 +124,24 @@ int main(void)
             nodes_open_subscription_window(&time_sync, &radio, TDMA_SLOT_LENGTH_MS, handle_received_packet);
         }
 
-        if (sx1276_receive_packet(&radio, &header, payload, sizeof(payload), &payload_length) == HAL_OK) {
-            handle_received_packet(&time_sync, &header, payload, payload_length);
+        {
+            uint8_t rx_frame[96] = {0};
+            uint8_t rx_frame_length = 0;
+            sx1276_rx_metadata_t rx_metadata = {0};
+
+            if (sx1276_receive_bytes(&radio, rx_frame, sizeof(rx_frame), &rx_frame_length, &rx_metadata) == HAL_OK
+                && rx_metadata.crc_ok
+                && rx_frame_length >= EMESH_FRAME_HEADER_SIZE) {
+                emesh_frame_decode_header(rx_frame, &header);
+                payload_length = (uint8_t)(rx_frame_length - EMESH_FRAME_HEADER_SIZE);
+                if (payload_length > sizeof(payload)) {
+                    payload_length = sizeof(payload);
+                }
+                for (uint8_t i = 0; i < payload_length; ++i) {
+                    payload[i] = rx_frame[EMESH_FRAME_HEADER_SIZE + i];
+                }
+                handle_received_packet(&time_sync, &header, payload, payload_length);
+            }
         }
         HAL_Delay(10);
     }

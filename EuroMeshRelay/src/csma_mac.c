@@ -46,17 +46,29 @@ bool csma_mac_is_channel_clear(csma_mac_t *mac)
     return rssi < mac->rssi_threshold;
 }
 
-HAL_StatusTypeDef csma_mac_send(csma_mac_t *mac, const sx1276_packet_header_t *header, const uint8_t *payload, uint8_t payload_length)
+HAL_StatusTypeDef csma_mac_send(csma_mac_t *mac, const emesh_frame_header_t *header, const uint8_t *payload, uint8_t payload_length)
 {
     uint8_t attempts = 0;
+    uint8_t frame[255] = {0};
+    uint8_t frame_length = 0;
 
-    if (mac == NULL || mac->radio == NULL) {
+    if (mac == NULL || mac->radio == NULL || header == NULL || payload == NULL || payload_length == 0U) {
         return HAL_ERROR;
     }
 
+    if ((uint16_t)payload_length + EMESH_FRAME_HEADER_SIZE > sizeof(frame)) {
+        return HAL_ERROR;
+    }
+
+    emesh_frame_encode_header(header, frame);
+    for (uint8_t i = 0; i < payload_length; ++i) {
+        frame[EMESH_FRAME_HEADER_SIZE + i] = payload[i];
+    }
+    frame_length = (uint8_t)(payload_length + EMESH_FRAME_HEADER_SIZE);
+
     while (attempts < mac->max_attempts) {
         if (csma_mac_is_channel_clear(mac)) {
-            return sx1276_send_packet(mac->radio, header, payload, payload_length);
+            return sx1276_send_bytes(mac->radio, frame, frame_length, 2000U);
         }
         HAL_Delay(csma_mac_next_backoff_ms(mac));
         attempts++;
@@ -65,7 +77,7 @@ HAL_StatusTypeDef csma_mac_send(csma_mac_t *mac, const sx1276_packet_header_t *h
     return HAL_TIMEOUT;
 }
 
-HAL_StatusTypeDef csma_mac_send_tdma(csma_mac_t *mac, const sx1276_packet_header_t *header, const uint8_t *payload, uint8_t payload_length, uint32_t frame_start_ms, uint32_t slot_length_ms, uint8_t slot_index)
+HAL_StatusTypeDef csma_mac_send_tdma(csma_mac_t *mac, const emesh_frame_header_t *header, const uint8_t *payload, uint8_t payload_length, uint32_t frame_start_ms, uint32_t slot_length_ms, uint8_t slot_index)
 {
     uint32_t slot_offset_ms = (uint32_t)slot_index * slot_length_ms;
     uint32_t slot_start_ms = frame_start_ms + slot_offset_ms;
@@ -83,5 +95,5 @@ HAL_StatusTypeDef csma_mac_send_tdma(csma_mac_t *mac, const sx1276_packet_header
         HAL_Delay(1);
     }
 
-    return sx1276_send_packet(mac->radio, header, payload, payload_length);
+    return csma_mac_send(mac, header, payload, payload_length);
 }

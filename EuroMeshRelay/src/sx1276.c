@@ -10,6 +10,20 @@ static void sx1276_deselect(sx1276_t *radio)
     HAL_GPIO_WritePin(radio->nss_port, radio->nss_pin, GPIO_PIN_SET);
 }
 
+static uint8_t sx1276_dbm_to_pa_config(int8_t tx_power_dbm)
+{
+    int8_t clamped = tx_power_dbm;
+
+    if (clamped < 2) {
+        clamped = 2;
+    }
+    if (clamped > 17) {
+        clamped = 17;
+    }
+
+    return (uint8_t)(0x80U | (uint8_t)(clamped - 2));
+}
+
 void sx1276_init(sx1276_t *radio)
 {
     sx1276_reset(radio);
@@ -19,7 +33,7 @@ void sx1276_init(sx1276_t *radio)
     sx1276_write_reg(radio, SX1276_REG_IRQ_FLAGS, 0xFF);
     sx1276_write_reg(radio, SX1276_REG_PREAMBLE_MSB, 0x00);
     sx1276_write_reg(radio, SX1276_REG_PREAMBLE_LSB, 0x08);
-    sx1276_write_reg(radio, SX1276_REG_PA_CONFIG, 0x8F);
+    sx1276_set_irq_mapping(radio, 0x00);
 }
 
 void sx1276_reset(sx1276_t *radio)
@@ -81,52 +95,56 @@ void sx1276_set_frequency(sx1276_t *radio, uint32_t frequency_hz)
     sx1276_write_reg(radio, SX1276_REG_FRF_LSB, (uint8_t)(frf));
 }
 
-void sx1276_configure_lora(sx1276_t *radio, uint32_t frequency_hz, uint8_t bandwidth_bits, uint8_t spreading_factor)
+void sx1276_configure_lora(sx1276_t *radio, const sx1276_lora_config_t *config)
 {
-    uint8_t modem_config_1 = (uint8_t)((bandwidth_bits << 4) | (0x01 << 1));
-    uint8_t modem_config_2 = (uint8_t)((spreading_factor << 4) | 0x04);
+    uint8_t modem_config_1 = 0;
+    uint8_t modem_config_2 = 0;
     uint8_t modem_config_3 = 0x04;
 
-    sx1276_set_frequency(radio, frequency_hz);
+    if (radio == NULL || config == NULL) {
+        return;
+    }
+
+    modem_config_1 = (uint8_t)((config->bandwidth_bits << 4) | ((config->coding_rate_bits & 0x07U) << 1));
+    if (config->implicit_header_mode) {
+        modem_config_1 |= 0x01U;
+    }
+    modem_config_2 = (uint8_t)((config->spreading_factor << 4) | 0x04U);
+
+    sx1276_set_frequency(radio, config->frequency_hz);
     sx1276_write_reg(radio, SX1276_REG_MODEM_CONFIG_1, modem_config_1);
     sx1276_write_reg(radio, SX1276_REG_MODEM_CONFIG_2, modem_config_2);
     sx1276_write_reg(radio, SX1276_REG_MODEM_CONFIG_3, modem_config_3);
     sx1276_write_reg(radio, SX1276_REG_SYMB_TIMEOUT_LSB, 0x08);
+    sx1276_write_reg(radio, SX1276_REG_PA_CONFIG, sx1276_dbm_to_pa_config(config->tx_power_dbm));
 }
 
-HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header_t *header, const uint8_t *payload, uint8_t payload_length)
+void sx1276_set_irq_mapping(sx1276_t *radio, uint8_t dio0_mapping_bits)
 {
-    uint8_t header_buffer[SX1276_PACKET_HEADER_SIZE] = {0};
-    uint8_t total_length = payload_length + (uint8_t)sizeof(header_buffer);
+    uint8_t value = (uint8_t)((dio0_mapping_bits & 0x03U) << 6);
 
-    header_buffer[0] = header->type;
-    header_buffer[1] = header->flags;
-    header_buffer[2] = header->ttl;
-    header_buffer[3] = (uint8_t)(header->src_id >> 24);
-    header_buffer[4] = (uint8_t)(header->src_id >> 16);
-    header_buffer[5] = (uint8_t)(header->src_id >> 8);
-    header_buffer[6] = (uint8_t)(header->src_id);
-    header_buffer[7] = (uint8_t)(header->dest_id >> 24);
-    header_buffer[8] = (uint8_t)(header->dest_id >> 16);
-    header_buffer[9] = (uint8_t)(header->dest_id >> 8);
-    header_buffer[10] = (uint8_t)(header->dest_id);
-    header_buffer[11] = (uint8_t)(header->seq >> 8);
-    header_buffer[12] = (uint8_t)(header->seq);
+    sx1276_write_reg(radio, SX1276_REG_DIO_MAPPING_1, value);
+}
+
+HAL_StatusTypeDef sx1276_send_bytes(sx1276_t *radio, const uint8_t *data, uint8_t data_length, uint32_t timeout_ms)
+{
+    uint32_t start = 0;
+
+    if (radio == NULL || data == NULL || data_length == 0U) {
+        return HAL_ERROR;
+    }
 
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_STDBY_MODE);
     sx1276_write_reg(radio, SX1276_REG_FIFO_TX_BASE_ADDR, 0x00);
     sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, 0x00);
-    sx1276_write_burst(radio, SX1276_REG_FIFO, header_buffer, sizeof(header_buffer));
-    if (payload_length > 0U) {
-        sx1276_write_burst(radio, SX1276_REG_FIFO, payload, payload_length);
-    }
-    sx1276_write_reg(radio, SX1276_REG_PAYLOAD_LENGTH, total_length);
+    sx1276_write_burst(radio, SX1276_REG_FIFO, data, data_length);
+    sx1276_write_reg(radio, SX1276_REG_PAYLOAD_LENGTH, data_length);
     sx1276_write_reg(radio, SX1276_REG_IRQ_FLAGS, SX1276_IRQ_TX_DONE);
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_TX_MODE);
 
-    uint32_t start = HAL_GetTick();
+    start = HAL_GetTick();
     while ((sx1276_read_reg(radio, SX1276_REG_IRQ_FLAGS) & SX1276_IRQ_TX_DONE) == 0U) {
-        if ((HAL_GetTick() - start) > 2000U) {
+        if ((HAL_GetTick() - start) > timeout_ms) {
             return HAL_TIMEOUT;
         }
     }
@@ -134,50 +152,48 @@ HAL_StatusTypeDef sx1276_send_packet(sx1276_t *radio, const sx1276_packet_header
     return HAL_OK;
 }
 
-HAL_StatusTypeDef sx1276_receive_packet(sx1276_t *radio, sx1276_packet_header_t *header, uint8_t *payload, uint8_t payload_capacity, uint8_t *payload_length)
+HAL_StatusTypeDef sx1276_receive_bytes(sx1276_t *radio, uint8_t *buffer, uint8_t buffer_capacity, uint8_t *received_length, sx1276_rx_metadata_t *metadata)
 {
-    uint8_t header_buffer[SX1276_PACKET_HEADER_SIZE] = {0};
+    uint8_t irq_flags = 0;
     uint8_t available = 0;
-    uint8_t payload_size = 0;
+    bool implicit_header = false;
+
+    if (radio == NULL || buffer == NULL || received_length == NULL) {
+        return HAL_ERROR;
+    }
 
     sx1276_write_reg(radio, SX1276_REG_OP_MODE, SX1276_LONG_RANGE_MODE | SX1276_RX_CONTINUOUS_MODE);
-    if ((sx1276_read_reg(radio, SX1276_REG_IRQ_FLAGS) & SX1276_IRQ_RX_DONE) == 0U) {
+    irq_flags = sx1276_read_reg(radio, SX1276_REG_IRQ_FLAGS);
+    if ((irq_flags & SX1276_IRQ_RX_DONE) == 0U) {
         return HAL_BUSY;
     }
 
-    sx1276_write_reg(radio, SX1276_REG_IRQ_FLAGS, SX1276_IRQ_RX_DONE);
     sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, sx1276_read_reg(radio, SX1276_REG_FIFO_RX_CURRENT));
     available = sx1276_read_reg(radio, SX1276_REG_RX_NB_BYTES);
-    if (available < sizeof(header_buffer)) {
-        sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, 0x00);
+    if (available > buffer_capacity) {
+        sx1276_write_reg(radio, SX1276_REG_IRQ_FLAGS, irq_flags);
         return HAL_ERROR;
     }
 
-    sx1276_read_burst(radio, SX1276_REG_FIFO, header_buffer, sizeof(header_buffer));
-    header->type = header_buffer[0];
-    header->flags = header_buffer[1];
-    header->ttl = header_buffer[2];
-    header->src_id = ((uint32_t)header_buffer[3] << 24)
-        | ((uint32_t)header_buffer[4] << 16)
-        | ((uint32_t)header_buffer[5] << 8)
-        | ((uint32_t)header_buffer[6]);
-    header->dest_id = ((uint32_t)header_buffer[7] << 24)
-        | ((uint32_t)header_buffer[8] << 16)
-        | ((uint32_t)header_buffer[9] << 8)
-        | ((uint32_t)header_buffer[10]);
-    header->seq = (uint16_t)((header_buffer[11] << 8) | header_buffer[12]);
-    payload_size = (uint8_t)(available - (uint8_t)sizeof(header_buffer));
+    if (available > 0U) {
+        sx1276_read_burst(radio, SX1276_REG_FIFO, buffer, available);
+    }
+    *received_length = available;
 
-    if (payload_size > payload_capacity) {
-        sx1276_write_reg(radio, SX1276_REG_FIFO_ADDR_PTR, 0x00);
-        return HAL_ERROR;
+    if (metadata != NULL) {
+        int8_t raw_snr = (int8_t)sx1276_read_reg(radio, SX1276_REG_PKT_SNR_VALUE);
+        int16_t snr_qdb = (int16_t)raw_snr;
+        int16_t packet_rssi = (int16_t)sx1276_read_reg(radio, SX1276_REG_PKT_RSSI_VALUE);
+
+        implicit_header = (sx1276_read_reg(radio, SX1276_REG_MODEM_CONFIG_1) & 0x01U) != 0U;
+        metadata->snr_db = (int8_t)(snr_qdb / 4);
+        metadata->rssi_dbm = (int16_t)(packet_rssi - 157);
+        metadata->timestamp_ms = HAL_GetTick();
+        metadata->crc_ok = (irq_flags & SX1276_IRQ_PAYLOAD_CRC_ERROR) == 0U;
+        metadata->implicit_header_mode = implicit_header;
+        metadata->irq_flags = irq_flags;
     }
 
-    if (payload_size > 0U) {
-        sx1276_read_burst(radio, SX1276_REG_FIFO, payload, payload_size);
-    }
-    if (payload_length != NULL) {
-        *payload_length = payload_size;
-    }
+    sx1276_write_reg(radio, SX1276_REG_IRQ_FLAGS, irq_flags);
     return HAL_OK;
 }
