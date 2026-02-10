@@ -33,24 +33,34 @@ void nodes_open_subscription_window(time_sync_t *sync,
                                     nodes_packet_handler_t packet_handler)
 {
     uint32_t start_ms = HAL_GetTick();
-    sx1276_packet_header_t rx_header = {0};
-    uint8_t rx_payload[64] = {0};
-    uint8_t rx_payload_length = 0;
+    emesh_frame_header_t rx_header = {0};
+    uint8_t rx_frame[96] = {0};
+    uint8_t rx_frame_length = 0;
+    sx1276_rx_metadata_t rx_metadata = {0};
 
     if (radio == NULL || packet_handler == NULL) {
         return;
     }
 
     while ((HAL_GetTick() - start_ms) < window_ms) {
-        if (sx1276_receive_packet(radio, &rx_header, rx_payload, sizeof(rx_payload), &rx_payload_length) == HAL_OK) {
-            packet_handler(sync, &rx_header, rx_payload, rx_payload_length);
+        if (sx1276_receive_bytes(radio, rx_frame, sizeof(rx_frame), &rx_frame_length, &rx_metadata) == HAL_OK) {
+            uint8_t payload_length = 0;
+
+            if (!rx_metadata.crc_ok || rx_frame_length < EMESH_FRAME_HEADER_SIZE) {
+                HAL_Delay(1);
+                continue;
+            }
+
+            emesh_frame_decode_header(rx_frame, &rx_header);
+            payload_length = (uint8_t)(rx_frame_length - EMESH_FRAME_HEADER_SIZE);
+            packet_handler(sync, &rx_header, &rx_frame[EMESH_FRAME_HEADER_SIZE], payload_length);
         } else {
             HAL_Delay(1);
         }
     }
 }
 
-void nodes_handle_subscription_packet(const sx1276_packet_header_t *header,
+void nodes_handle_subscription_packet(const emesh_frame_header_t *header,
                                       const uint8_t *payload,
                                       uint8_t payload_length)
 {
