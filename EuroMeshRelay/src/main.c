@@ -19,31 +19,68 @@ static SPI_HandleTypeDef hspi1;
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
+static void Error_Handler(void);
 
 static void handle_received_packet(time_sync_t *sync,
                                    const emesh_frame_header_t *header,
                                    const uint8_t *payload,
                                    uint8_t payload_length);
 
+/* Wait until target_ms, handling HAL_GetTick() wrap-around via signed comparison. */
 static void wait_until_ms(uint32_t target_ms)
 {
-    while (HAL_GetTick() < target_ms) {
+    while ((int32_t)(target_ms - HAL_GetTick()) > 0) {
         HAL_Delay(1);
     }
 }
 
-static uint8_t build_beacon_payload(uint8_t *payload, uint8_t capacity)
+/*
+ * Build a beacon payload carrying time sync data when UTC is valid.
+ *
+ * Wire format (starting at payload[0]):
+ *   [type:1][flags:1][utc_epoch_ms:8][pps_tick_ms:4]  = 14 bytes total
+ *
+ * Receivers pass payload[1..] to time_sync_handle_payload, which expects:
+ *   [flags:1][utc_epoch_ms:8][pps_tick_ms:4]
+ */
+static uint8_t build_beacon_payload(const time_sync_t *sync, uint8_t *payload, uint8_t capacity)
 {
-    if (capacity < 5U) {
+    const uint8_t BEACON_SIZE = 14U;
+
+    if (payload == NULL || capacity < BEACON_SIZE) {
         return 0;
     }
-    uint32_t now_ms = HAL_GetTick();
+
     payload[0] = EMESH_PACKET_TYPE_BEACON;
-    payload[1] = (uint8_t)now_ms;
-    payload[2] = (uint8_t)(now_ms >> 8);
-    payload[3] = (uint8_t)(now_ms >> 16);
-    payload[4] = (uint8_t)(now_ms >> 24);
-    return 5U;
+
+    if (sync != NULL && sync->utc_valid && sync->pps_valid) {
+        uint32_t now_tick = HAL_GetTick();
+        uint32_t elapsed  = now_tick - sync->last_update_tick_ms;
+        uint64_t utc_ms   = sync->last_utc_epoch_ms + (uint64_t)elapsed;
+        uint32_t pps      = sync->last_pps_tick_ms;
+
+        payload[1]  = TIME_SYNC_FLAG_UTC_VALID | TIME_SYNC_FLAG_PPS_VALID;
+        payload[2]  = (uint8_t)(utc_ms);
+        payload[3]  = (uint8_t)(utc_ms >> 8);
+        payload[4]  = (uint8_t)(utc_ms >> 16);
+        payload[5]  = (uint8_t)(utc_ms >> 24);
+        payload[6]  = (uint8_t)(utc_ms >> 32);
+        payload[7]  = (uint8_t)(utc_ms >> 40);
+        payload[8]  = (uint8_t)(utc_ms >> 48);
+        payload[9]  = (uint8_t)(utc_ms >> 56);
+        payload[10] = (uint8_t)(pps);
+        payload[11] = (uint8_t)(pps >> 8);
+        payload[12] = (uint8_t)(pps >> 16);
+        payload[13] = (uint8_t)(pps >> 24);
+    } else {
+        /* No valid time — broadcast presence only; flags=0 causes receivers to skip sync. */
+        payload[1] = 0x00U;
+        for (uint8_t i = 2U; i < BEACON_SIZE; ++i) {
+            payload[i] = 0x00U;
+        }
+    }
+
+    return BEACON_SIZE;
 }
 
 static void handle_received_packet(time_sync_t *sync,
@@ -51,17 +88,24 @@ static void handle_received_packet(time_sync_t *sync,
                                    const uint8_t *payload,
                                    uint8_t payload_length)
 {
+    uint8_t packet_type;
+    bool sync_requested;
+
     if (payload_length == 0U) {
         return;
     }
-    uint8_t packet_type = payload[0];
-    bool sync_requested = (header->flags & EMESH_FRAME_FLAG_TIME_SYNC_REQUEST) != 0U;
+    packet_type    = payload[0];
+    sync_requested = (header->flags & EMESH_FRAME_FLAG_TIME_SYNC_REQUEST) != 0U;
 
     if (header->type != packet_type) {
         return;
     }
 
-    if (packet_type == EMESH_PACKET_TYPE_BEACON || packet_type == EMESH_PACKET_TYPE_ACK) {
+    if (packet_type == EMESH_PACKET_TYPE_BEACON) {
+        /*
+         * Beacons carry time sync data in the format expected by time_sync_handle_payload.
+         * ACK packets use a different wire encoding and are not routed here.
+         */
         time_sync_handle_payload(sync, &payload[1], payload_length - 1U, sync_requested);
     } else if (packet_type == EMESH_PACKET_TYPE_SUBSCRIPTION) {
         nodes_handle_subscription_packet(header, payload, payload_length);
@@ -91,51 +135,72 @@ int main(void)
     MX_SPI1_Init();
 
     sx1276_init(&radio);
-    sx1276_lora_config_t radio_config = {
-        .frequency_hz = 869525000U,
-        .bandwidth_bits = 0x07,
-        .spreading_factor = 0x07,
-        .coding_rate_bits = 0x01,
-        .tx_power_dbm = 15,
-        .implicit_header_mode = false,
-    };
+    {
+        sx1276_lora_config_t radio_config = {
+            .frequency_hz      = 869525000U,
+            .bandwidth_bits    = 0x07U,
+            .spreading_factor  = 0x07U,
+            .coding_rate_bits  = 0x01U,
+            .tx_power_dbm      = 15,
+            .implicit_header_mode = false,
+            .use_pa_boost      = true,
+        };
+        sx1276_configure_lora(&radio, &radio_config);
+    }
 
-    sx1276_configure_lora(&radio, &radio_config);
     time_sync_init(&time_sync, TIME_SYNC_TIMEOUT_MS, TIME_SYNC_MAX_SKEW_MS);
     csma_mac_init(&mac, &radio, 150U, 5U, 20U, 3U);
 
     while (1) {
-        uint8_t payload_length = 0;
-        uint32_t frame_start_ms = tdma_frame_start_ms(HAL_GetTick());
-        uint32_t subscription_slot_start_ms = frame_start_ms + (TDMA_SUBSCRIPTION_SLOT_INDEX * TDMA_SLOT_LENGTH_MS);
+        uint8_t payload_length;
+        uint32_t frame_start_ms          = tdma_next_frame_start_ms(HAL_GetTick());
+        uint32_t subscription_slot_start = frame_start_ms
+                                         + TDMA_SUBSCRIPTION_SLOT_INDEX * TDMA_SLOT_LENGTH_MS;
 
-        payload_length = build_beacon_payload(payload, sizeof(payload));
+        /* Slot 0: transmit beacon with current time sync state. */
+        payload_length = build_beacon_payload(&time_sync, payload, sizeof(payload));
         header.type = EMESH_PACKET_TYPE_BEACON;
         header.seq++;
-        (void)csma_mac_send_tdma(&mac, &header, payload, payload_length, frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_BEACON_SLOT_INDEX);
+        (void)csma_mac_send_tdma(&mac, &header, payload, payload_length,
+                                 frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_BEACON_SLOT_INDEX);
 
+        /* Slot 1: optionally send a subscription request, then listen for incoming ones. */
         payload_length = nodes_build_subscription_payload(payload, sizeof(payload));
         header.type = EMESH_PACKET_TYPE_SUBSCRIPTION;
         header.seq++;
         if (payload_length > 0U) {
-            (void)csma_mac_send_tdma(&mac, &header, payload, payload_length, frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_SUBSCRIPTION_SLOT_INDEX);
+            (void)csma_mac_send_tdma(&mac, &header, payload, payload_length,
+                                     frame_start_ms, TDMA_SLOT_LENGTH_MS, TDMA_SUBSCRIPTION_SLOT_INDEX);
         } else {
-            wait_until_ms(subscription_slot_start_ms);
-            nodes_open_subscription_window(&time_sync, &radio, TDMA_SLOT_LENGTH_MS, handle_received_packet);
+            wait_until_ms(subscription_slot_start);
         }
 
+        /* Open a subscription window for the remainder of the subscription slot.
+         * Unsigned subtraction (now - slot_start) correctly handles tick wrap-around. */
+        {
+            uint32_t elapsed   = HAL_GetTick() - subscription_slot_start;
+            uint32_t remaining = (elapsed < TDMA_SLOT_LENGTH_MS)
+                                 ? (TDMA_SLOT_LENGTH_MS - elapsed) : 0U;
+            if (remaining > 0U) {
+                nodes_open_subscription_window(&time_sync, &radio, remaining,
+                                               handle_received_packet);
+            }
+        }
+
+        /* Poll for any frame received outside of the scheduled TDMA slots. */
         {
             uint8_t rx_frame[96] = {0};
             uint8_t rx_frame_length = 0;
             sx1276_rx_metadata_t rx_metadata = {0};
 
-            if (sx1276_receive_bytes(&radio, rx_frame, sizeof(rx_frame), &rx_frame_length, &rx_metadata) == HAL_OK
+            if (sx1276_receive_bytes(&radio, rx_frame, sizeof(rx_frame),
+                                     &rx_frame_length, &rx_metadata) == HAL_OK
                 && rx_metadata.crc_ok
                 && rx_frame_length >= EMESH_FRAME_HEADER_SIZE) {
                 emesh_frame_decode_header(rx_frame, &header);
                 payload_length = (uint8_t)(rx_frame_length - EMESH_FRAME_HEADER_SIZE);
-                if (payload_length > sizeof(payload)) {
-                    payload_length = sizeof(payload);
+                if (payload_length > (uint8_t)sizeof(payload)) {
+                    payload_length = (uint8_t)sizeof(payload);
                 }
                 for (uint8_t i = 0; i < payload_length; ++i) {
                     payload[i] = rx_frame[EMESH_FRAME_HEADER_SIZE + i];
@@ -143,7 +208,15 @@ int main(void)
                 handle_received_packet(&time_sync, &header, payload, payload_length);
             }
         }
+
         HAL_Delay(10);
+    }
+}
+
+static void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {
     }
 }
 
@@ -164,8 +237,7 @@ static void SystemClock_Config(void)
     osc_init.PLL.PLLP = RCC_PLLP_DIV4;
     osc_init.PLL.PLLQ = 7;
     if (HAL_RCC_OscConfig(&osc_init) != HAL_OK) {
-        while (1) {
-        }
+        Error_Handler();
     }
 
     clk_init.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
@@ -174,8 +246,7 @@ static void SystemClock_Config(void)
     clk_init.APB1CLKDivider = RCC_HCLK_DIV2;
     clk_init.APB2CLKDivider = RCC_HCLK_DIV1;
     if (HAL_RCC_ClockConfig(&clk_init, FLASH_LATENCY_2) != HAL_OK) {
-        while (1) {
-        }
+        Error_Handler();
     }
 }
 
@@ -196,8 +267,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
     hspi1.Init.CRCPolynomial = 7;
     if (HAL_SPI_Init(&hspi1) != HAL_OK) {
-        while (1) {
-        }
+        Error_Handler();
     }
 }
 

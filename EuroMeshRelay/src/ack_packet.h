@@ -14,8 +14,8 @@ extern "C" {
 #define EMESH_ACK_FLAG_RX_TICK_PRESENT  0x01
 #define EMESH_ACK_FLAG_UTC_PRESENT      0x02
 #define EMESH_ACK_FLAG_PPS_TICK_PRESENT 0x04
-#define EMESH_ACK_FLAG_NAK              0x08
-#define EMESH_ACK_FLAG_ACK_OF_ACK       0x10
+#define EMESH_ACK_FLAG_NAK              0x08  /* Reserved — not yet implemented */
+#define EMESH_ACK_FLAG_ACK_OF_ACK       0x10  /* Reserved — not yet implemented */
 
 typedef struct {
     uint8_t flags;

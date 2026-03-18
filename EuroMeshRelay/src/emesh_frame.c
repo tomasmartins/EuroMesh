@@ -2,7 +2,7 @@
 
 void emesh_frame_encode_header(const emesh_frame_header_t *header, uint8_t *buffer)
 {
-    if (header == 0 || buffer == 0) {
+    if (header == NULL || buffer == NULL) {
         return;
     }
 
@@ -23,7 +23,7 @@ void emesh_frame_encode_header(const emesh_frame_header_t *header, uint8_t *buff
 
 void emesh_frame_decode_header(const uint8_t *buffer, emesh_frame_header_t *header)
 {
-    if (header == 0 || buffer == 0) {
+    if (header == NULL || buffer == NULL) {
         return;
     }
 

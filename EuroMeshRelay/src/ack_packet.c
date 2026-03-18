@@ -27,11 +27,13 @@ static uint32_t read_u32_le(const uint8_t *buffer)
 
 size_t emesh_ack_payload_size(const emesh_ack_packet_t *ack)
 {
-    size_t size = 1 + 1 + sizeof(uint16_t);
+    size_t size;
 
     if (ack == NULL) {
         return 0;
     }
+
+    size = 1U + 1U + sizeof(uint16_t);
 
     if ((ack->flags & EMESH_ACK_FLAG_RX_TICK_PRESENT) != 0u) {
         size += sizeof(uint32_t);
