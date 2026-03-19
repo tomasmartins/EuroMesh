@@ -13,7 +13,7 @@ extern "C" {
 #define TDMA_FRAME_SLOT_COUNT        2U
 #define TDMA_FRAME_LENGTH_MS (TDMA_SLOT_LENGTH_MS * TDMA_FRAME_SLOT_COUNT)
 
-uint32_t tdma_frame_start_ms(uint32_t now_ms);
+uint32_t tdma_next_frame_start_ms(uint32_t now_ms);
 
 #ifdef __cplusplus
 }

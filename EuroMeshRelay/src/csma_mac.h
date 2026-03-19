@@ -15,6 +15,7 @@ typedef struct {
     uint32_t backoff_min_ms;
     uint32_t backoff_max_ms;
     uint8_t max_attempts;
+    uint32_t prng_state; /* LCG state for collision-avoidance backoff */
 } csma_mac_t;
 
 void csma_mac_init(csma_mac_t *mac, sx1276_t *radio, uint8_t rssi_threshold, uint32_t backoff_min_ms, uint32_t backoff_max_ms, uint8_t max_attempts);

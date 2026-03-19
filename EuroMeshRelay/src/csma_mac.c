@@ -5,23 +5,28 @@ static uint8_t csma_mac_read_rssi(const csma_mac_t *mac)
     return sx1276_read_reg(mac->radio, SX1276_REG_RSSI_VALUE);
 }
 
-static uint32_t csma_mac_next_backoff_ms(const csma_mac_t *mac)
+/* Numerical Recipes LCG — fast, adequate for collision-avoidance jitter. */
+static uint32_t csma_prng_next(csma_mac_t *mac)
+{
+    mac->prng_state = mac->prng_state * 1664525U + 1013904223U;
+    return mac->prng_state;
+}
+
+static uint32_t csma_mac_next_backoff_ms(csma_mac_t *mac)
 {
     uint32_t min_ms = mac->backoff_min_ms;
     uint32_t max_ms = mac->backoff_max_ms;
-    uint32_t span = 0;
+    uint32_t span;
 
     if (max_ms < min_ms) {
         max_ms = min_ms;
     }
     span = max_ms - min_ms + 1U;
-    if (span == 0U) {
-        return min_ms;
-    }
-    return min_ms + (HAL_GetTick() % span);
+    return min_ms + (csma_prng_next(mac) % span);
 }
 
-void csma_mac_init(csma_mac_t *mac, sx1276_t *radio, uint8_t rssi_threshold, uint32_t backoff_min_ms, uint32_t backoff_max_ms, uint8_t max_attempts)
+void csma_mac_init(csma_mac_t *mac, sx1276_t *radio, uint8_t rssi_threshold,
+                   uint32_t backoff_min_ms, uint32_t backoff_max_ms, uint8_t max_attempts)
 {
     if (mac == NULL) {
         return;
@@ -31,11 +36,13 @@ void csma_mac_init(csma_mac_t *mac, sx1276_t *radio, uint8_t rssi_threshold, uin
     mac->backoff_min_ms = backoff_min_ms;
     mac->backoff_max_ms = backoff_max_ms;
     mac->max_attempts = max_attempts;
+    /* Seed PRNG from current tick XOR stack address for per-boot variation. */
+    mac->prng_state = HAL_GetTick() ^ (uint32_t)(uintptr_t)mac;
 }
 
 bool csma_mac_is_channel_clear(csma_mac_t *mac)
 {
-    uint8_t rssi = 0;
+    uint8_t rssi;
 
     if (mac == NULL || mac->radio == NULL) {
         return false;
@@ -46,11 +53,12 @@ bool csma_mac_is_channel_clear(csma_mac_t *mac)
     return rssi < mac->rssi_threshold;
 }
 
-HAL_StatusTypeDef csma_mac_send(csma_mac_t *mac, const emesh_frame_header_t *header, const uint8_t *payload, uint8_t payload_length)
+HAL_StatusTypeDef csma_mac_send(csma_mac_t *mac, const emesh_frame_header_t *header,
+                                const uint8_t *payload, uint8_t payload_length)
 {
     uint8_t attempts = 0;
     uint8_t frame[255] = {0};
-    uint8_t frame_length = 0;
+    uint8_t frame_length;
 
     if (mac == NULL || mac->radio == NULL || header == NULL || payload == NULL || payload_length == 0U) {
         return HAL_ERROR;
@@ -77,21 +85,23 @@ HAL_StatusTypeDef csma_mac_send(csma_mac_t *mac, const emesh_frame_header_t *hea
     return HAL_TIMEOUT;
 }
 
-HAL_StatusTypeDef csma_mac_send_tdma(csma_mac_t *mac, const emesh_frame_header_t *header, const uint8_t *payload, uint8_t payload_length, uint32_t frame_start_ms, uint32_t slot_length_ms, uint8_t slot_index)
+HAL_StatusTypeDef csma_mac_send_tdma(csma_mac_t *mac, const emesh_frame_header_t *header,
+                                     const uint8_t *payload, uint8_t payload_length,
+                                     uint32_t frame_start_ms, uint32_t slot_length_ms,
+                                     uint8_t slot_index)
 {
-    uint32_t slot_offset_ms = (uint32_t)slot_index * slot_length_ms;
-    uint32_t slot_start_ms = frame_start_ms + slot_offset_ms;
-    uint32_t now = HAL_GetTick();
+    uint32_t slot_start_ms = frame_start_ms + (uint32_t)slot_index * slot_length_ms;
 
     if (mac == NULL || mac->radio == NULL || slot_length_ms == 0U) {
         return HAL_ERROR;
     }
 
-    if (now > slot_start_ms) {
+    /* Signed comparison of the difference handles HAL_GetTick() wrap-around. */
+    if ((int32_t)(slot_start_ms - HAL_GetTick()) < 0) {
         return HAL_TIMEOUT;
     }
 
-    while (HAL_GetTick() < slot_start_ms) {
+    while ((int32_t)(slot_start_ms - HAL_GetTick()) > 0) {
         HAL_Delay(1);
     }
 
