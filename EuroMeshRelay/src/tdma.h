@@ -42,18 +42,29 @@ extern "C" {
 #endif
 
 /* ── Super-frame timing ──────────────────────────────────────────────────── */
-#define TDMA_SLOT_MS               100U    /* base slot granularity             */
-#define TDMA_BEACON_SLOT_MS       1000U    /* duration of one beacon slot       */
+/*
+ * Each beaconing node (gateway or relay) occupies one 100 ms slot within the
+ * 1000 ms beacon window:
+ *
+ *   Slot 0   (  0– 100 ms) Gateway beacon
+ *   Slot 1   (100– 200 ms) Relay 1 beacon
+ *   ...
+ *   Slot 9   (900–1000 ms) Relay 9 beacon
+ *   Reg window (1000–1500 ms) SUBSCRIPTION contention
+ *   CSMA period (~58.5 s)
+ */
+#define TDMA_SLOT_MS               100U    /* per-node beacon slot duration     */
+#define TDMA_BEACON_WINDOW_MS     1000U    /* total duration of all beacon slots */
 #define TDMA_REG_SLOT_MS           500U    /* registration window duration      */
 #define TDMA_SUPERFRAME_PERIOD_MS  60000U  /* 60 s between super-frame starts   */
 
-/* Maximum number of beacon slots (slot 0 = gateway, 1..N-1 = relays). */
-#define TDMA_MAX_BEACON_SLOTS      8U
+/* Number of beacon slots derived from the beacon window and slot size. */
+#define TDMA_MAX_BEACON_SLOTS  (TDMA_BEACON_WINDOW_MS / TDMA_SLOT_MS)  /* 10 */
 
 /*
  * Registration slot index: immediately after the last beacon slot.
- * Offset into the super-frame: TDMA_MAX_BEACON_SLOTS × TDMA_BEACON_SLOT_MS
- *                            = 8 × 500 = 4000 ms.
+ * Offset into the super-frame: TDMA_MAX_BEACON_SLOTS × TDMA_SLOT_MS
+ *                            = 10 × 100 = 1000 ms = TDMA_BEACON_WINDOW_MS.
  */
 #define TDMA_REG_SLOT_INDEX        TDMA_MAX_BEACON_SLOTS
 

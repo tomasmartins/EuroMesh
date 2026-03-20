@@ -8,7 +8,7 @@ uint32_t tdma_next_frame_start_ms(uint32_t now_ms)
 
 uint32_t tdma_slot_start_ms(uint32_t frame_start_ms, uint8_t slot_index)
 {
-    return frame_start_ms + (uint32_t)slot_index * TDMA_BEACON_SLOT_MS;
+    return frame_start_ms + (uint32_t)slot_index * TDMA_SLOT_MS;
 }
 
 uint32_t tdma_next_slot_ms(uint32_t now_ms, uint8_t slot_index)
