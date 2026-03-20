@@ -42,9 +42,10 @@ extern "C" {
 #endif
 
 /* ── Super-frame timing ──────────────────────────────────────────────────── */
-#define TDMA_BEACON_SLOT_MS        500U    /* duration of one beacon slot     */
-#define TDMA_REG_SLOT_MS           500U    /* registration window duration    */
-#define TDMA_SUPERFRAME_PERIOD_MS  60000U  /* 60 s between super-frame starts */
+#define TDMA_SLOT_MS               100U    /* base slot granularity             */
+#define TDMA_BEACON_SLOT_MS       1000U    /* duration of one beacon slot       */
+#define TDMA_REG_SLOT_MS           500U    /* registration window duration      */
+#define TDMA_SUPERFRAME_PERIOD_MS  60000U  /* 60 s between super-frame starts   */
 
 /* Maximum number of beacon slots (slot 0 = gateway, 1..N-1 = relays). */
 #define TDMA_MAX_BEACON_SLOTS      8U
