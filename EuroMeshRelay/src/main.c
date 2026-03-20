@@ -68,6 +68,44 @@
  */
 #define MY_CAPABILITY  (EMESH_NODE_TIER_RELAY | EMESH_NODE_FLAG_GPS)
 
+/* ── Relay operational mode ───────────────────────────────────────────────── */
+/*
+ * Three-state machine governing how the relay sources its clock and whether
+ * it treats itself as the network root:
+ *
+ *   SEARCHING  — Boot state.  The relay listens for a gateway beacon for up to
+ *                STANDALONE_SEARCH_TIMEOUT_MS before declaring itself root.
+ *                If a gateway is heard and registration completes within the
+ *                window, the relay jumps directly to SYNCED.
+ *
+ *   STANDALONE — No gateway was found (or the gateway has gone silent).  The
+ *                relay self-seeds its clock from the monotonic tick (stratum 1)
+ *                and beacons as the network root so that downstream nodes
+ *                always have a valid time reference.
+ *
+ *   SYNCED     — An upstream gateway is present and registered.  The relay
+ *                uses the gateway's time (stratum = gateway_stratum + 1).
+ *                If no upstream beacon is heard for GATEWAY_LOST_TIMEOUT_MS
+ *                the relay reverts to STANDALONE to keep the network alive.
+ */
+typedef enum {
+    RELAY_MODE_SEARCHING  = 0,
+    RELAY_MODE_STANDALONE = 1,
+    RELAY_MODE_SYNCED     = 2,
+} relay_mode_t;
+
+/*
+ * Wait two super-frames (120 s) before promoting to standalone root.
+ * This gives the gateway time to transmit at least two beacons on boot.
+ */
+#define STANDALONE_SEARCH_TIMEOUT_MS  (2U * TDMA_SUPERFRAME_PERIOD_MS)   /* 120 s */
+
+/*
+ * Declare the gateway lost after three consecutive missed super-frames (180 s).
+ * Two missed beacons are tolerated before falling back to standalone.
+ */
+#define GATEWAY_LOST_TIMEOUT_MS       (3U * TDMA_SUPERFRAME_PERIOD_MS)   /* 180 s */
+
 /* Age-out periods — expressed as multiples of the super-frame period. */
 #define NODE_MAX_AGE_MS  (3U * TDMA_SUPERFRAME_PERIOD_MS)   /* 3 min */
 #define NB_MAX_AGE_MS    (5U * TDMA_SUPERFRAME_PERIOD_MS)   /* 5 min */
@@ -107,12 +145,18 @@ static uint64_t g_time_req_t1_ms = 0U;   /* our UTC when TIME_REQ was sent */
 /* Global outbound sequence counter. */
 static uint16_t g_tx_seq = 0U;
 
+/* ── Relay mode state ─────────────────────────────────────────────────────── */
+static relay_mode_t g_relay_mode             = RELAY_MODE_SEARCHING;
+static uint32_t     g_boot_tick_ms           = 0U;
+static uint32_t     g_last_upstream_heard_ms = 0U;
+
 /* ── Forward declarations ─────────────────────────────────────────────────── */
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void Error_Handler(void);
 
+static void relay_mode_update(uint32_t now_ms);
 static void handle_rx_frame(uint32_t my_id,
                             const emesh_frame_header_t *hdr,
                             const uint8_t *payload, uint8_t payload_len,
@@ -260,6 +304,67 @@ static void try_send_time_req(uint32_t my_id, uint32_t now_ms)
 }
 
 /*
+ * Drive the relay operational mode state machine.
+ * Call once at the top of every super-frame iteration.
+ */
+static void relay_mode_update(uint32_t now_ms)
+{
+    switch (g_relay_mode) {
+
+    case RELAY_MODE_SEARCHING:
+        /*
+         * Fast-path: if a gateway was already heard and registration
+         * completed inside the search window, go straight to SYNCED.
+         */
+        if (reg_ctx_is_registered(&g_upstream_ctx) && g_time_sync.utc_valid) {
+            g_relay_mode             = RELAY_MODE_SYNCED;
+            g_last_upstream_heard_ms = now_ms;
+            break;
+        }
+        /*
+         * Search timeout: no gateway heard within the window.
+         * Self-seed the clock from the monotonic tick so downstream nodes
+         * receive a valid (though not UTC-accurate) time reference.
+         * Using EMESH_STRATUM_GPS (0) as the source stratum causes
+         * time_sync_apply_sample to set our stratum to 1.
+         */
+        if ((now_ms - g_boot_tick_ms) >= STANDALONE_SEARCH_TIMEOUT_MS) {
+            time_sync_apply_sample(&g_time_sync,
+                                   (uint64_t)now_ms, /* uptime-based epoch */
+                                   0U,               /* no PPS             */
+                                   EMESH_STRATUM_GPS, /* src 0 → stratum 1 */
+                                   now_ms);
+            g_relay_mode = RELAY_MODE_STANDALONE;
+        }
+        break;
+
+    case RELAY_MODE_STANDALONE:
+        /*
+         * Gateway appeared and upstream registration completed.
+         * Transition to SYNCED; the time_sync is already updated because
+         * time_sync_handle_beacon accepted the lower-stratum beacon.
+         */
+        if (reg_ctx_is_registered(&g_upstream_ctx)) {
+            g_relay_mode             = RELAY_MODE_SYNCED;
+            g_last_upstream_heard_ms = now_ms;
+        }
+        break;
+
+    case RELAY_MODE_SYNCED:
+        /*
+         * Gateway has gone silent for too long.  Revert to STANDALONE so
+         * downstream nodes continue receiving valid beacons.  The clock
+         * remains valid from the last gateway sync; drift will increase
+         * gradually until a gateway re-appears.
+         */
+        if ((now_ms - g_last_upstream_heard_ms) >= GATEWAY_LOST_TIMEOUT_MS) {
+            g_relay_mode = RELAY_MODE_STANDALONE;
+        }
+        break;
+    }
+}
+
+/*
  * Dispatch a decoded inbound frame to the correct protocol handler.
  */
 static void handle_rx_frame(uint32_t my_id,
@@ -307,6 +412,15 @@ static void handle_rx_frame(uint32_t my_id,
                             EMESH_NODE_TIER_RELAY, /* beacon senders are >= relay */
                             bp.stratum,
                             now_ms);
+
+            /*
+             * Track the last time we heard from a higher-quality (lower-
+             * stratum) upstream source.  Used by relay_mode_update() to
+             * detect gateway loss in RELAY_MODE_SYNCED.
+             */
+            if (bp.stratum < g_time_sync.stratum) {
+                g_last_upstream_heard_ms = now_ms;
+            }
 
             /*
              * Feed the beacon into the upstream registration state machine so
@@ -536,6 +650,8 @@ int main(void)
     nb_table_init(&g_nb_table);
     retry_init(&g_retry);
 
+    g_boot_tick_ms = HAL_GetTick();
+
     /* ═══════════════════════════════════════════════════════════════════════
      * Super-frame loop
      * ═══════════════════════════════════════════════════════════════════════ */
@@ -548,6 +664,9 @@ int main(void)
 
         now_ms          = HAL_GetTick();
         beacon_start_ms = tdma_next_beacon_ms(now_ms);
+
+        /* ── 0. Update relay operational mode ────────────────────────────── */
+        relay_mode_update(now_ms);
 
         /* ── 1. Wait for the beacon slot ──────────────────────────────────── */
         wait_until_ms(beacon_start_ms);
