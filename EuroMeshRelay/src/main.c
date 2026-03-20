@@ -40,6 +40,7 @@
 #include "emesh_node_caps.h"
 #include "emesh_packet_types.h"
 #include "frame_queue.h"
+#include "gps_pps.h"
 #include "neighbour_table.h"
 #include "nodes.h"
 #include "registration.h"
@@ -68,6 +69,44 @@
  */
 #define MY_CAPABILITY  (EMESH_NODE_TIER_RELAY | EMESH_NODE_FLAG_GPS)
 
+/* ── Relay operational mode ───────────────────────────────────────────────── */
+/*
+ * Three-state machine governing how the relay sources its clock and whether
+ * it treats itself as the network root:
+ *
+ *   SEARCHING  — Boot state.  The relay listens for a gateway beacon for up to
+ *                STANDALONE_SEARCH_TIMEOUT_MS before declaring itself root.
+ *                If a gateway is heard and registration completes within the
+ *                window, the relay jumps directly to SYNCED.
+ *
+ *   STANDALONE — No gateway was found (or the gateway has gone silent).  The
+ *                relay self-seeds its clock from the monotonic tick (stratum 1)
+ *                and beacons as the network root so that downstream nodes
+ *                always have a valid time reference.
+ *
+ *   SYNCED     — An upstream gateway is present and registered.  The relay
+ *                uses the gateway's time (stratum = gateway_stratum + 1).
+ *                If no upstream beacon is heard for GATEWAY_LOST_TIMEOUT_MS
+ *                the relay reverts to STANDALONE to keep the network alive.
+ */
+typedef enum {
+    RELAY_MODE_SEARCHING  = 0,
+    RELAY_MODE_STANDALONE = 1,
+    RELAY_MODE_SYNCED     = 2,
+} relay_mode_t;
+
+/*
+ * Wait two super-frames (120 s) before promoting to standalone root.
+ * This gives the gateway time to transmit at least two beacons on boot.
+ */
+#define STANDALONE_SEARCH_TIMEOUT_MS  (2U * TDMA_SUPERFRAME_PERIOD_MS)   /* 120 s */
+
+/*
+ * Declare the gateway lost after three consecutive missed super-frames (180 s).
+ * Two missed beacons are tolerated before falling back to standalone.
+ */
+#define GATEWAY_LOST_TIMEOUT_MS       (3U * TDMA_SUPERFRAME_PERIOD_MS)   /* 180 s */
+
 /* Age-out periods — expressed as multiples of the super-frame period. */
 #define NODE_MAX_AGE_MS  (3U * TDMA_SUPERFRAME_PERIOD_MS)   /* 3 min */
 #define NB_MAX_AGE_MS    (5U * TDMA_SUPERFRAME_PERIOD_MS)   /* 5 min */
@@ -83,6 +122,9 @@
 
 /* ── Static peripheral handles ────────────────────────────────────────────── */
 static SPI_HandleTypeDef hspi1;
+
+/* ── GPS / PPS time source ────────────────────────────────────────────────── */
+static gps_pps_t g_gps;
 
 /* ── Static mesh state ────────────────────────────────────────────────────── */
 static sx1276_t      g_radio;
@@ -107,12 +149,18 @@ static uint64_t g_time_req_t1_ms = 0U;   /* our UTC when TIME_REQ was sent */
 /* Global outbound sequence counter. */
 static uint16_t g_tx_seq = 0U;
 
+/* ── Relay mode state ─────────────────────────────────────────────────────── */
+static relay_mode_t g_relay_mode             = RELAY_MODE_SEARCHING;
+static uint32_t     g_boot_tick_ms           = 0U;
+static uint32_t     g_last_upstream_heard_ms = 0U;
+
 /* ── Forward declarations ─────────────────────────────────────────────────── */
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void Error_Handler(void);
 
+static void relay_mode_update(uint32_t now_ms);
 static void handle_rx_frame(uint32_t my_id,
                             const emesh_frame_header_t *hdr,
                             const uint8_t *payload, uint8_t payload_len,
@@ -142,8 +190,29 @@ static void build_and_send_beacon(uint32_t my_id, bool reg_window_open)
     uint8_t              payload[BEACON_PAYLOAD_SIZE];
     uint8_t              payload_len;
     emesh_frame_header_t hdr;
+    uint32_t             now_ms = HAL_GetTick();
 
-    beacon_payload_from_sync(&g_time_sync, HAL_GetTick(), reg_window_open, &beacon);
+    beacon_payload_from_sync(&g_time_sync, now_ms, reg_window_open, &beacon);
+
+    /*
+     * Populate telemetry block.
+     * uptime_s: seconds since boot (HAL_GetTick() is in ms).
+     * upstream_rssi: RSSI of the last gateway/parent beacon (stored in
+     *   g_upstream_ctx.best_rssi_dbm after each successful beacon RX).
+     * node_count: number of downstream nodes registered with this relay.
+     * tx_power: nominal TX power configured for the SX1276 (in dBm).
+     */
+    beacon.telem_flags       = BEACON_TELEM_FLAG_TX_PWR
+                             | BEACON_TELEM_FLAG_RSSI
+                             | BEACON_TELEM_FLAG_NODES
+                             | BEACON_TELEM_FLAG_UPTIME;
+    beacon.tx_power_dbm      = 15;                      /* SX1276 PA_BOOST   */
+    beacon.upstream_rssi_dbm = (g_relay_mode == RELAY_MODE_SYNCED)
+                                ? g_upstream_ctx.best_rssi_dbm
+                                : (int8_t)0x80; /* INT8_MIN — no upstream     */
+    beacon.node_count        = g_relay.count;
+    beacon.uptime_s          = (uint32_t)((now_ms - g_boot_tick_ms) / 1000U);
+
     payload_len = beacon_payload_encode(&beacon, payload, sizeof(payload));
     if (payload_len == 0U) {
         return;
@@ -260,6 +329,71 @@ static void try_send_time_req(uint32_t my_id, uint32_t now_ms)
 }
 
 /*
+ * Drive the relay operational mode state machine.
+ * Call once at the top of every super-frame iteration.
+ */
+static void relay_mode_update(uint32_t now_ms)
+{
+    switch (g_relay_mode) {
+
+    case RELAY_MODE_SEARCHING:
+        /*
+         * Fast-path: if a gateway was already heard and registration
+         * completed inside the search window, go straight to SYNCED.
+         */
+        if (reg_ctx_is_registered(&g_upstream_ctx) && g_time_sync.utc_valid) {
+            g_relay_mode             = RELAY_MODE_SYNCED;
+            g_last_upstream_heard_ms = now_ms;
+            break;
+        }
+        /*
+         * Search timeout: no gateway heard within the window.
+         * If GPS is locked, apply a GPS sample now and enter STANDALONE with
+         * real UTC at stratum 1.  Otherwise fall back to a monotonic-tick
+         * seed so downstream nodes still receive a valid (though not UTC-
+         * accurate) time reference.
+         */
+        if ((now_ms - g_boot_tick_ms) >= STANDALONE_SEARCH_TIMEOUT_MS) {
+            if (gps_pps_is_locked(&g_gps, now_ms)) {
+                gps_pps_apply_to_sync(&g_gps, &g_time_sync, now_ms);
+            } else {
+                time_sync_apply_sample(&g_time_sync,
+                                       (uint64_t)now_ms, /* uptime-based epoch */
+                                       0U,               /* no PPS             */
+                                       EMESH_STRATUM_GPS, /* src 0 → stratum 1 */
+                                       now_ms);
+            }
+            g_relay_mode = RELAY_MODE_STANDALONE;
+        }
+        break;
+
+    case RELAY_MODE_STANDALONE:
+        /*
+         * Gateway appeared and upstream registration completed.
+         * Transition to SYNCED; the time_sync is already updated because
+         * time_sync_handle_beacon accepted the lower-stratum beacon.
+         */
+        if (reg_ctx_is_registered(&g_upstream_ctx)) {
+            g_relay_mode             = RELAY_MODE_SYNCED;
+            g_last_upstream_heard_ms = now_ms;
+        }
+        break;
+
+    case RELAY_MODE_SYNCED:
+        /*
+         * Gateway has gone silent for too long.  Revert to STANDALONE so
+         * downstream nodes continue receiving valid beacons.  The clock
+         * remains valid from the last gateway sync; drift will increase
+         * gradually until a gateway re-appears.
+         */
+        if ((now_ms - g_last_upstream_heard_ms) >= GATEWAY_LOST_TIMEOUT_MS) {
+            g_relay_mode = RELAY_MODE_STANDALONE;
+        }
+        break;
+    }
+}
+
+/*
  * Dispatch a decoded inbound frame to the correct protocol handler.
  */
 static void handle_rx_frame(uint32_t my_id,
@@ -307,6 +441,15 @@ static void handle_rx_frame(uint32_t my_id,
                             EMESH_NODE_TIER_RELAY, /* beacon senders are >= relay */
                             bp.stratum,
                             now_ms);
+
+            /*
+             * Track the last time we heard from a higher-quality (lower-
+             * stratum) upstream source.  Used by relay_mode_update() to
+             * detect gateway loss in RELAY_MODE_SYNCED.
+             */
+            if (bp.stratum < g_time_sync.stratum) {
+                g_last_upstream_heard_ms = now_ms;
+            }
 
             /*
              * Feed the beacon into the upstream registration state machine so
@@ -525,16 +668,36 @@ int main(void)
     /* ── Protocol modules ─────────────────────────────────────────────────── */
     time_sync_init(&g_time_sync, TIME_SYNC_TIMEOUT_MS, TIME_SYNC_MAX_SKEW_MS);
 
+    /*
+     * In standalone mode the relay acts as the root (gateway-equivalent) and
+     * occupies TDMA slot 0.  Once it registers with a gateway the gateway
+     * will assign a different slot via REG_RESPONSE; the slot is then stored
+     * in g_upstream_ctx and applied to g_relay.my_beacon_slot before the next
+     * super-frame (see relay_mode_update / RELAY_MODE_SYNCED transition).
+     */
     reg_relay_init(&g_relay,
                    /* pan_id          = */ (uint16_t)(my_id & 0xFFFFU),
                    /* local_stratum   = */ EMESH_STRATUM_UNKNOWN,
-                   /* nb_adv_interval = */ 30U);
+                   /* nb_adv_interval = */ 30U,
+                   /* my_beacon_slot  = */ TDMA_GATEWAY_SLOT_INDEX);
 
     reg_ctx_init(&g_upstream_ctx, MY_CAPABILITY);
 
     dedup_init(&g_dedup);
     nb_table_init(&g_nb_table);
     retry_init(&g_retry);
+
+    /* ── GPS / PPS ─────────────────────────────────────────────────────────── */
+    /*
+     * Only initialise the GPS hardware if this build includes GPS capability.
+     * The EMESH_NODE_FLAG_GPS bit in MY_CAPABILITY acts as the compile-time
+     * gate so boards without GPS hardware compile cleanly.
+     */
+#if (MY_CAPABILITY & EMESH_NODE_FLAG_GPS)
+    gps_pps_init(&g_gps);
+#endif
+
+    g_boot_tick_ms = HAL_GetTick();
 
     /* ═══════════════════════════════════════════════════════════════════════
      * Super-frame loop
@@ -547,7 +710,16 @@ int main(void)
         uint32_t failed_dest;
 
         now_ms          = HAL_GetTick();
-        beacon_start_ms = tdma_next_beacon_ms(now_ms);
+        /*
+         * Schedule the next beacon on this relay's own TDMA slot.
+         * In standalone mode my_beacon_slot == TDMA_GATEWAY_SLOT_INDEX (0).
+         * After a successful gateway registration the slot is updated to the
+         * value assigned in the REG_RESPONSE beacon_slot field.
+         */
+        beacon_start_ms = tdma_next_slot_ms(now_ms, g_relay.my_beacon_slot);
+
+        /* ── 0. Update relay operational mode ────────────────────────────── */
+        relay_mode_update(now_ms);
 
         /* ── 1. Wait for the beacon slot ──────────────────────────────────── */
         wait_until_ms(beacon_start_ms);
@@ -629,12 +801,57 @@ int main(void)
             /* Initiate two-way clock sync if due. */
             try_send_time_req(my_id, now_ms);
 
+            /*
+             * Apply GPS time if locked.  This keeps the relay's clock
+             * continuously disciplined by the PPS edge in both STANDALONE
+             * and SYNCED modes.  In SYNCED mode the GPS sample and the
+             * gateway beacon both feed time_sync; whichever is from a lower
+             * stratum source wins via time_sync_should_accept().
+             */
+#if (MY_CAPABILITY & EMESH_NODE_FLAG_GPS)
+            gps_pps_apply_to_sync(&g_gps, &g_time_sync, now_ms);
+#endif
+
             /* Receive and dispatch one frame (non-blocking). */
             (void)try_receive_frame(my_id, now_ms);
         }
     }
 
     /* Unreachable. */
+}
+
+/* ── GPS / PPS ISR handlers ───────────────────────────────────────────────── */
+
+/*
+ * USART3 global interrupt — forwards the received byte to the GPS parser.
+ * HAL_UART_RxCpltCallback is called by HAL_UART_IRQHandler when a byte
+ * arrives on any UART.  We guard on the instance.
+ */
+void USART3_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&g_gps.huart);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == GPS_UART_INSTANCE) {
+        gps_pps_feed_byte(&g_gps, g_gps.rx_byte);
+    }
+}
+
+/*
+ * EXTI line 0 interrupt — records the HAL_GetTick() at the PPS rising edge.
+ */
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPS_PPS_PIN);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)
+{
+    if (gpio_pin == GPS_PPS_PIN) {
+        gps_pps_on_pps_edge(&g_gps, HAL_GetTick());
+    }
 }
 
 /* ── STM32 HAL initialisation ─────────────────────────────────────────────── */

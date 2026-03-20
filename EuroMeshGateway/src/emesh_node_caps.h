@@ -1,11 +1,11 @@
 /*
  * emesh_node_caps.h — Node tier, mobility, and identity definitions.
+ *                     Linux / Raspberry Pi version (no STM32 HAL).
  *
- * The capability byte encodes both tier and mobility in a single uint8_t:
- *   bits [1:0]  tier   (EMESH_NODE_TIER_*)
- *   bit  [6]    GPS    node has a GPS / PPS reference
- *   bit  [7]    MOBILE node may move; re-registration is expected on movement
- *   bits [5:2]  reserved, must be zero
+ * Protocol constants are identical to the relay version.
+ * emesh_get_node_id() reads the RPi CPU serial from /proc/cpuinfo and folds
+ * it to 32 bits.  Falls back to the process PID for development environments
+ * that do not expose a CPU serial (e.g., x86 build machines).
  */
 
 #ifndef EMESH_NODE_CAPS_H
@@ -13,6 +13,10 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,7 +27,7 @@ extern "C" {
 #define EMESH_NODE_TIER_RELAY    0x01U  /* mid-tier forwarder                 */
 #define EMESH_NODE_TIER_GATEWAY  0x02U  /* backbone / internet uplink         */
 
-/* ── Capability flags (OR'd into the capability byte) ────────────────────── */
+/* ── Capability flags ────────────────────────────────────────────────────── */
 #define EMESH_NODE_FLAG_FORWARD  0x04U  /* node may forward data frames       */
 #define EMESH_NODE_FLAG_GPS      0x40U  /* node has GPS / PPS reference       */
 #define EMESH_NODE_FLAG_MOBILE   0x80U  /* may move; triggers re-registration */
@@ -41,18 +45,38 @@ extern "C" {
 /* ── Broadcast destination ───────────────────────────────────────────────── */
 #define EMESH_DEST_BROADCAST  0xFFFFFFFFU
 
-/* ── STM32F4 unique device ID ────────────────────────────────────────────── */
+/* ── Node ID (Raspberry Pi CPU serial, folded to 32 bits) ────────────────── */
 /*
- * The STM32F4 provides a 96-bit unique device ID at 0x1FFF7A10.
- * XOR of the three 32-bit words yields a compact 32-bit node ID.
- * Collision probability across ≤32 nodes is negligible.
+ * Reads "Serial : <hex>" from /proc/cpuinfo.
+ * Folds the 64-bit serial to 32 bits via XOR.
+ * Returns (uint32_t)getpid() as a fallback on non-RPi hosts.
  */
-#define EMESH_STM32_UID_BASE  0x1FFF7A10U
-
 static inline uint32_t emesh_get_node_id(void)
 {
-    const volatile uint32_t *uid = (const volatile uint32_t *)EMESH_STM32_UID_BASE;
-    return uid[0] ^ uid[1] ^ uid[2];
+    FILE    *f;
+    char     line[256];
+    uint64_t serial = 0U;
+
+    f = fopen("/proc/cpuinfo", "r");
+    if (f != NULL) {
+        while (fgets(line, (int)sizeof(line), f) != NULL) {
+            if (strncmp(line, "Serial", 6) == 0) {
+                const char *colon = strchr(line, ':');
+                if (colon != NULL) {
+                    serial = (uint64_t)strtoull(colon + 2, NULL, 16);
+                }
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    if (serial == 0U) {
+        /* Fallback for non-RPi hosts (development / CI). */
+        serial = (uint64_t)(unsigned)getpid();
+    }
+
+    return (uint32_t)(serial ^ (serial >> 32));
 }
 
 #ifdef __cplusplus
