@@ -190,8 +190,29 @@ static void build_and_send_beacon(uint32_t my_id, bool reg_window_open)
     uint8_t              payload[BEACON_PAYLOAD_SIZE];
     uint8_t              payload_len;
     emesh_frame_header_t hdr;
+    uint32_t             now_ms = HAL_GetTick();
 
-    beacon_payload_from_sync(&g_time_sync, HAL_GetTick(), reg_window_open, &beacon);
+    beacon_payload_from_sync(&g_time_sync, now_ms, reg_window_open, &beacon);
+
+    /*
+     * Populate telemetry block.
+     * uptime_s: seconds since boot (HAL_GetTick() is in ms).
+     * upstream_rssi: RSSI of the last gateway/parent beacon (stored in
+     *   g_upstream_ctx.best_rssi_dbm after each successful beacon RX).
+     * node_count: number of downstream nodes registered with this relay.
+     * tx_power: nominal TX power configured for the SX1276 (in dBm).
+     */
+    beacon.telem_flags       = BEACON_TELEM_FLAG_TX_PWR
+                             | BEACON_TELEM_FLAG_RSSI
+                             | BEACON_TELEM_FLAG_NODES
+                             | BEACON_TELEM_FLAG_UPTIME;
+    beacon.tx_power_dbm      = 15;                      /* SX1276 PA_BOOST   */
+    beacon.upstream_rssi_dbm = (g_relay_mode == RELAY_MODE_SYNCED)
+                                ? g_upstream_ctx.best_rssi_dbm
+                                : (int8_t)0x80; /* INT8_MIN — no upstream     */
+    beacon.node_count        = g_relay.count;
+    beacon.uptime_s          = (uint32_t)((now_ms - g_boot_tick_ms) / 1000U);
+
     payload_len = beacon_payload_encode(&beacon, payload, sizeof(payload));
     if (payload_len == 0U) {
         return;
@@ -647,10 +668,18 @@ int main(void)
     /* ── Protocol modules ─────────────────────────────────────────────────── */
     time_sync_init(&g_time_sync, TIME_SYNC_TIMEOUT_MS, TIME_SYNC_MAX_SKEW_MS);
 
+    /*
+     * In standalone mode the relay acts as the root (gateway-equivalent) and
+     * occupies TDMA slot 0.  Once it registers with a gateway the gateway
+     * will assign a different slot via REG_RESPONSE; the slot is then stored
+     * in g_upstream_ctx and applied to g_relay.my_beacon_slot before the next
+     * super-frame (see relay_mode_update / RELAY_MODE_SYNCED transition).
+     */
     reg_relay_init(&g_relay,
                    /* pan_id          = */ (uint16_t)(my_id & 0xFFFFU),
                    /* local_stratum   = */ EMESH_STRATUM_UNKNOWN,
-                   /* nb_adv_interval = */ 30U);
+                   /* nb_adv_interval = */ 30U,
+                   /* my_beacon_slot  = */ TDMA_GATEWAY_SLOT_INDEX);
 
     reg_ctx_init(&g_upstream_ctx, MY_CAPABILITY);
 
@@ -681,7 +710,13 @@ int main(void)
         uint32_t failed_dest;
 
         now_ms          = HAL_GetTick();
-        beacon_start_ms = tdma_next_beacon_ms(now_ms);
+        /*
+         * Schedule the next beacon on this relay's own TDMA slot.
+         * In standalone mode my_beacon_slot == TDMA_GATEWAY_SLOT_INDEX (0).
+         * After a successful gateway registration the slot is updated to the
+         * value assigned in the REG_RESPONSE beacon_slot field.
+         */
+        beacon_start_ms = tdma_next_slot_ms(now_ms, g_relay.my_beacon_slot);
 
         /* ── 0. Update relay operational mode ────────────────────────────── */
         relay_mode_update(now_ms);

@@ -30,6 +30,7 @@
 
 #include "csma_mac.h"
 #include "emesh_frame.h"
+#include "tdma.h"
 #include "time_sync.h"
 
 #ifdef __cplusplus
@@ -61,7 +62,9 @@ typedef struct {
     uint8_t  status;
     uint16_t pan_id;
     uint8_t  stratum;
-    uint8_t  nb_adv_interval_s; /* 0 = no advertisements */
+    uint8_t  nb_adv_interval_s; /* 0 = no advertisements                   */
+    uint8_t  beacon_slot;       /* TDMA beacon slot assigned to this node;  */
+                                /* TDMA_NO_SLOT_ASSIGNED (0xFF) if none     */
 } reg_response_t;
 
 uint8_t sub_request_encode(const sub_request_t *req, uint8_t *buf, uint8_t capacity);
@@ -145,7 +148,8 @@ static inline bool reg_ctx_is_registered(const reg_ctx_t *ctx)
 typedef struct {
     uint32_t node_id;
     uint8_t  capability;
-    uint8_t  _pad[3];
+    uint8_t  beacon_slot;     /* TDMA slot assigned to this node             */
+    uint8_t  _pad[2];
     int16_t  last_rssi_dbm;
     uint32_t last_seen_ms;
     uint32_t registered_ms;
@@ -154,14 +158,17 @@ typedef struct {
 typedef struct {
     reg_node_entry_t nodes[REG_MAX_NODES];
     uint8_t          count;
-    uint8_t          _pad[3];
+    uint8_t          my_beacon_slot;     /* this relay's own TDMA slot       */
+    uint8_t          next_relay_slot;    /* next slot to assign to a relay   */
+    uint8_t          nb_adv_interval_s;
     uint16_t         pan_id;
     uint8_t          local_stratum;
-    uint8_t          nb_adv_interval_s;
-} reg_relay_t;                /* 256 + 8 = 264 bytes */
+    uint8_t          _pad;
+} reg_relay_t;
 
 void reg_relay_init(reg_relay_t *relay, uint16_t pan_id,
-                    uint8_t local_stratum, uint8_t nb_adv_interval_s);
+                    uint8_t local_stratum, uint8_t nb_adv_interval_s,
+                    uint8_t my_beacon_slot);
 
 /*
  * Process an incoming SUBSCRIPTION request.

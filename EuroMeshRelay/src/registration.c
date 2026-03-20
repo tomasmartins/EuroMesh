@@ -53,8 +53,8 @@ uint8_t reg_response_encode(const reg_response_t *resp, uint8_t *buf, uint8_t ca
     buf[3] = (uint8_t)(resp->pan_id >> 8);
     buf[4] = resp->stratum;
     buf[5] = resp->nb_adv_interval_s;
-    buf[6] = 0x00U; /* reserved */
-    buf[7] = 0x00U; /* reserved */
+    buf[6] = resp->beacon_slot;  /* TDMA beacon slot, 0xFF = none assigned  */
+    buf[7] = 0x00U;              /* reserved                                */
     return REG_RESPONSE_PAYLOAD_SIZE;
 }
 
@@ -70,6 +70,7 @@ bool reg_response_decode(const uint8_t *buf, uint8_t length, reg_response_t *out
     out->pan_id              = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
     out->stratum             = buf[4];
     out->nb_adv_interval_s   = buf[5];
+    out->beacon_slot         = buf[6]; /* TDMA_NO_SLOT_ASSIGNED (0xFF) = none */
     return true;
 }
 
@@ -236,7 +237,8 @@ void reg_ctx_reregister(reg_ctx_t *ctx)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void reg_relay_init(reg_relay_t *relay, uint16_t pan_id,
-                    uint8_t local_stratum, uint8_t nb_adv_interval_s)
+                    uint8_t local_stratum, uint8_t nb_adv_interval_s,
+                    uint8_t my_beacon_slot)
 {
     if (relay == NULL) {
         return;
@@ -245,6 +247,13 @@ void reg_relay_init(reg_relay_t *relay, uint16_t pan_id,
     relay->pan_id            = pan_id;
     relay->local_stratum     = local_stratum;
     relay->nb_adv_interval_s = nb_adv_interval_s;
+    relay->my_beacon_slot    = my_beacon_slot;
+    /*
+     * Downstream relays are allocated slots starting after this relay's own
+     * slot.  If this relay is the gateway (slot 0), downstream relays start
+     * at slot 1.
+     */
+    relay->next_relay_slot   = (uint8_t)(my_beacon_slot + 1U);
 }
 
 /* Find an existing entry index, or REG_MAX_NODES if not found. */
@@ -292,6 +301,7 @@ void reg_relay_handle_request(reg_relay_t *relay,
             resp.pan_id            = relay->pan_id;
             resp.stratum           = relay->local_stratum;
             resp.nb_adv_interval_s = relay->nb_adv_interval_s;
+            resp.beacon_slot       = TDMA_NO_SLOT_ASSIGNED;
         } else {
             reg_node_entry_t *e = &relay->nodes[relay->count];
             e->node_id        = req_hdr->src_id;
@@ -299,15 +309,36 @@ void reg_relay_handle_request(reg_relay_t *relay,
             e->last_rssi_dbm  = req_rssi_dbm;
             e->last_seen_ms   = now_ms;
             e->registered_ms  = now_ms;
+
+            /*
+             * Assign a TDMA beacon slot if the registering node is a relay
+             * (it needs to beacon).  Leaf nodes (EMESH_NODE_TIER_NODE) do not
+             * transmit beacons and receive TDMA_NO_SLOT_ASSIGNED.
+             *
+             * The relay itself occupies its own slot (relay->my_beacon_slot).
+             * Downstream relays receive sequentially allocated slots starting
+             * from relay->next_relay_slot.
+             */
+            if (EMESH_NODE_TIER(req.capability) == EMESH_NODE_TIER_RELAY) {
+                if (relay->next_relay_slot < TDMA_MAX_BEACON_SLOTS) {
+                    e->beacon_slot = relay->next_relay_slot++;
+                } else {
+                    e->beacon_slot = TDMA_NO_SLOT_ASSIGNED; /* all slots used */
+                }
+            } else {
+                e->beacon_slot = TDMA_NO_SLOT_ASSIGNED; /* leaf node — no beacon */
+            }
+
             relay->count++;
 
             resp.status            = REG_STATUS_OK;
             resp.pan_id            = relay->pan_id;
             resp.stratum           = relay->local_stratum;
             resp.nb_adv_interval_s = relay->nb_adv_interval_s;
+            resp.beacon_slot       = e->beacon_slot;
         }
     } else {
-        /* Existing node — refresh entry */
+        /* Existing node — refresh entry, keep existing slot assignment. */
         relay->nodes[idx].capability    = req.capability;
         relay->nodes[idx].last_rssi_dbm = req_rssi_dbm;
         relay->nodes[idx].last_seen_ms  = now_ms;
@@ -316,6 +347,7 @@ void reg_relay_handle_request(reg_relay_t *relay,
         resp.pan_id            = relay->pan_id;
         resp.stratum           = relay->local_stratum;
         resp.nb_adv_interval_s = relay->nb_adv_interval_s;
+        resp.beacon_slot       = relay->nodes[idx].beacon_slot;
     }
 
     /* Build and transmit REG_RESPONSE (unicast back to requesting node). */
