@@ -40,6 +40,7 @@
 #include "emesh_node_caps.h"
 #include "emesh_packet_types.h"
 #include "frame_queue.h"
+#include "gps_pps.h"
 #include "neighbour_table.h"
 #include "nodes.h"
 #include "registration.h"
@@ -121,6 +122,9 @@ typedef enum {
 
 /* ── Static peripheral handles ────────────────────────────────────────────── */
 static SPI_HandleTypeDef hspi1;
+
+/* ── GPS / PPS time source ────────────────────────────────────────────────── */
+static gps_pps_t g_gps;
 
 /* ── Static mesh state ────────────────────────────────────────────────────── */
 static sx1276_t      g_radio;
@@ -323,17 +327,21 @@ static void relay_mode_update(uint32_t now_ms)
         }
         /*
          * Search timeout: no gateway heard within the window.
-         * Self-seed the clock from the monotonic tick so downstream nodes
-         * receive a valid (though not UTC-accurate) time reference.
-         * Using EMESH_STRATUM_GPS (0) as the source stratum causes
-         * time_sync_apply_sample to set our stratum to 1.
+         * If GPS is locked, apply a GPS sample now and enter STANDALONE with
+         * real UTC at stratum 1.  Otherwise fall back to a monotonic-tick
+         * seed so downstream nodes still receive a valid (though not UTC-
+         * accurate) time reference.
          */
         if ((now_ms - g_boot_tick_ms) >= STANDALONE_SEARCH_TIMEOUT_MS) {
-            time_sync_apply_sample(&g_time_sync,
-                                   (uint64_t)now_ms, /* uptime-based epoch */
-                                   0U,               /* no PPS             */
-                                   EMESH_STRATUM_GPS, /* src 0 → stratum 1 */
-                                   now_ms);
+            if (gps_pps_is_locked(&g_gps, now_ms)) {
+                gps_pps_apply_to_sync(&g_gps, &g_time_sync, now_ms);
+            } else {
+                time_sync_apply_sample(&g_time_sync,
+                                       (uint64_t)now_ms, /* uptime-based epoch */
+                                       0U,               /* no PPS             */
+                                       EMESH_STRATUM_GPS, /* src 0 → stratum 1 */
+                                       now_ms);
+            }
             g_relay_mode = RELAY_MODE_STANDALONE;
         }
         break;
@@ -650,6 +658,16 @@ int main(void)
     nb_table_init(&g_nb_table);
     retry_init(&g_retry);
 
+    /* ── GPS / PPS ─────────────────────────────────────────────────────────── */
+    /*
+     * Only initialise the GPS hardware if this build includes GPS capability.
+     * The EMESH_NODE_FLAG_GPS bit in MY_CAPABILITY acts as the compile-time
+     * gate so boards without GPS hardware compile cleanly.
+     */
+#if (MY_CAPABILITY & EMESH_NODE_FLAG_GPS)
+    gps_pps_init(&g_gps);
+#endif
+
     g_boot_tick_ms = HAL_GetTick();
 
     /* ═══════════════════════════════════════════════════════════════════════
@@ -748,12 +766,57 @@ int main(void)
             /* Initiate two-way clock sync if due. */
             try_send_time_req(my_id, now_ms);
 
+            /*
+             * Apply GPS time if locked.  This keeps the relay's clock
+             * continuously disciplined by the PPS edge in both STANDALONE
+             * and SYNCED modes.  In SYNCED mode the GPS sample and the
+             * gateway beacon both feed time_sync; whichever is from a lower
+             * stratum source wins via time_sync_should_accept().
+             */
+#if (MY_CAPABILITY & EMESH_NODE_FLAG_GPS)
+            gps_pps_apply_to_sync(&g_gps, &g_time_sync, now_ms);
+#endif
+
             /* Receive and dispatch one frame (non-blocking). */
             (void)try_receive_frame(my_id, now_ms);
         }
     }
 
     /* Unreachable. */
+}
+
+/* ── GPS / PPS ISR handlers ───────────────────────────────────────────────── */
+
+/*
+ * USART3 global interrupt — forwards the received byte to the GPS parser.
+ * HAL_UART_RxCpltCallback is called by HAL_UART_IRQHandler when a byte
+ * arrives on any UART.  We guard on the instance.
+ */
+void USART3_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&g_gps.huart);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == GPS_UART_INSTANCE) {
+        gps_pps_feed_byte(&g_gps, g_gps.rx_byte);
+    }
+}
+
+/*
+ * EXTI line 0 interrupt — records the HAL_GetTick() at the PPS rising edge.
+ */
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPS_PPS_PIN);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)
+{
+    if (gpio_pin == GPS_PPS_PIN) {
+        gps_pps_on_pps_edge(&g_gps, HAL_GetTick());
+    }
 }
 
 /* ── STM32 HAL initialisation ─────────────────────────────────────────────── */
