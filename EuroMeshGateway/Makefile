@@ -1,10 +1,7 @@
 # EuroMeshGateway — Linux Makefile
 #
-# Prerequisites:
-#   libloragw (Semtech SX1301 HAL)
-#     git clone https://github.com/Lora-net/lora_gateway
-#     cd lora_gateway && make
-#     sudo make install          # installs to /usr/local/{lib,include}
+# libloragw (Semtech SX1301 HAL v5.0.1) is bundled in libloragw/
+# No external dependencies required — just clone and make.
 #
 # Build:
 #   make
@@ -17,13 +14,70 @@
 #
 
 CC      ?= gcc
-CFLAGS  := -Wall -Wextra -Wpedantic -std=c99 -O2 \
-           -I./src \
-           -I/usr/local/include/libloragw
+AR      ?= ar
 
-LDFLAGS := -L/usr/local/lib \
-           -lloragw \
-           -lm
+# ── libloragw (bundled Semtech HAL) ───────────────────────────────────────
+LGW_DIR   := libloragw
+LGW_INC   := $(LGW_DIR)/inc
+LGW_SRC   := $(LGW_DIR)/src
+LGW_OBJ   := $(LGW_DIR)/obj
+LGW_LIB   := $(LGW_DIR)/libloragw.a
+
+LGW_SRCS  := $(LGW_SRC)/loragw_hal.c    \
+             $(LGW_SRC)/loragw_reg.c    \
+             $(LGW_SRC)/loragw_spi.native.c \
+             $(LGW_SRC)/loragw_aux.c    \
+             $(LGW_SRC)/loragw_radio.c  \
+             $(LGW_SRC)/loragw_gps.c    \
+             $(LGW_SRC)/loragw_fpga.c   \
+             $(LGW_SRC)/loragw_lbt.c
+
+LGW_OBJS  := $(patsubst $(LGW_SRC)/%.c, $(LGW_OBJ)/%.o, \
+               $(subst loragw_spi.native.c,loragw_spi.c,$(LGW_SRCS)))
+
+LGW_CFLAGS := -O2 -Wall -Wextra -std=c99 -I$(LGW_INC) -I$(LGW_DIR)
+
+# Generate inc/config.h from VERSION (debug flags all off for production)
+$(LGW_INC)/config.h: $(LGW_DIR)/VERSION
+	@echo "Generating $(LGW_INC)/config.h"
+	@VER=$$(cat $(LGW_DIR)/VERSION); \
+	 echo "#ifndef _LORAGW_CONFIGURATION_H"         > $@; \
+	 echo "#define _LORAGW_CONFIGURATION_H"         >> $@; \
+	 echo "  #define LIBLORAGW_VERSION \"$$VER\""   >> $@; \
+	 echo "  #define DEBUG_AUX  0"                  >> $@; \
+	 echo "  #define DEBUG_SPI  0"                  >> $@; \
+	 echo "  #define DEBUG_REG  0"                  >> $@; \
+	 echo "  #define DEBUG_HAL  0"                  >> $@; \
+	 echo "  #define DEBUG_GPS  0"                  >> $@; \
+	 echo "  #define DEBUG_GPIO 0"                  >> $@; \
+	 echo "  #define DEBUG_LBT  0"                  >> $@; \
+	 echo "#endif"                                  >> $@
+
+$(LGW_OBJ):
+	mkdir -p $(LGW_OBJ)
+
+# SPI module has a non-standard filename
+$(LGW_OBJ)/loragw_spi.o: $(LGW_SRC)/loragw_spi.native.c $(LGW_INC)/config.h | $(LGW_OBJ)
+	$(CC) $(LGW_CFLAGS) -c $< -o $@
+
+$(LGW_OBJ)/loragw_hal.o: $(LGW_SRC)/loragw_hal.c $(LGW_INC)/config.h \
+                           $(LGW_SRC)/arb_fw.var $(LGW_SRC)/agc_fw.var \
+                           $(LGW_SRC)/cal_fw.var | $(LGW_OBJ)
+	$(CC) $(LGW_CFLAGS) -c $< -o $@
+
+$(LGW_OBJ)/%.o: $(LGW_SRC)/%.c $(LGW_INC)/config.h | $(LGW_OBJ)
+	$(CC) $(LGW_CFLAGS) -c $< -o $@
+
+$(LGW_LIB): $(LGW_OBJS)
+	$(AR) rcs $@ $^
+
+# ── EuroMeshGateway application ───────────────────────────────────────────
+CFLAGS  := -Wall -Wextra -Wpedantic -std=c99 -O2 \
+           -D_XOPEN_SOURCE=600 \
+           -I./src \
+           -I$(LGW_INC)
+
+LDFLAGS := -L$(LGW_DIR) -lloragw -lrt -lm
 
 TARGET  := euromesh-gateway
 
@@ -39,9 +93,9 @@ OBJS    := $(SRCS:.c=.o)
 # ── Default target ────────────────────────────────────────────────────────
 .PHONY: all clean install
 
-all: $(TARGET)
+all: $(LGW_LIB) $(TARGET)
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(LGW_LIB)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
 %.o: %.c
@@ -66,7 +120,8 @@ src/gw_registration.o: src/gw_registration.c src/gw_registration.h \
 src/time_twoway.o:    src/time_twoway.c     src/time_twoway.h     \
                       src/emesh_packet_types.h
 
-src/lgw_hal.o:        src/lgw_hal.c         src/lgw_hal.h
+src/lgw_hal.o:        src/lgw_hal.c         src/lgw_hal.h         \
+                      $(LGW_INC)/loragw_hal.h
 
 # ── Install ───────────────────────────────────────────────────────────────
 install: $(TARGET)
@@ -75,3 +130,5 @@ install: $(TARGET)
 # ── Clean ─────────────────────────────────────────────────────────────────
 clean:
 	$(RM) $(OBJS) $(TARGET)
+	$(RM) $(LGW_OBJS) $(LGW_LIB)
+	$(RM) -r $(LGW_OBJ)

@@ -1,0 +1,5 @@
+euromesh-gateway
+src/*.o
+libloragw/obj/
+libloragw/libloragw.a
+libloragw/inc/config.h

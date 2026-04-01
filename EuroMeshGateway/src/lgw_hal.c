@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 /* Semtech libloragw public header. */
 #include "loragw_hal.h"
@@ -39,7 +40,7 @@ static bool g_started = false;
 
 bool lgw_hal_init(void)
 {
-    struct lgw_board_conf_s boardconf;
+    struct lgw_conf_board_s boardconf;
     struct lgw_conf_rxrf_s  rfconf;
     struct lgw_conf_rxif_s  ifconf;
     int                     rc;

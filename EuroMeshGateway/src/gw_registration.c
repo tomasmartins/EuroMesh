@@ -4,6 +4,7 @@
  * the csma_mac and STM32-dependent relay-side state machine is omitted.
  */
 
+#include <stddef.h>
 #include "gw_registration.h"
 #include "emesh_packet_types.h"
 
