@@ -85,6 +85,7 @@ SRCS    := src/gateway_main.c    \
            src/emesh_frame.c     \
            src/beacon_packet.c   \
            src/gw_registration.c \
+           src/gw_lora_peers.c   \
            src/time_twoway.c     \
            src/lgw_hal.c
 
@@ -114,8 +115,10 @@ $(TEST_SX1301): $(TEST_SX1301_OBJS) $(LGW_LIB)
 src/gateway_main.o:   src/gateway_main.c    src/beacon_packet.h   \
                       src/emesh_frame.h     src/emesh_node_caps.h  \
                       src/emesh_packet_types.h src/gw_registration.h \
-                      src/lgw_hal.h         src/time_sync.h       \
-                      src/time_twoway.h
+                      src/gw_lora_peers.h   src/lgw_hal.h         \
+                      src/time_sync.h       src/time_twoway.h
+
+src/gw_lora_peers.o:  src/gw_lora_peers.c   src/gw_lora_peers.h
 
 src/emesh_frame.o:    src/emesh_frame.c     src/emesh_frame.h     \
                       src/emesh_node_caps.h
