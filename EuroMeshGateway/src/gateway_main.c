@@ -504,6 +504,47 @@ static void handle_time_req(uint32_t my_id,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * DATA frame handler
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void handle_data(const emesh_frame_header_t *hdr,
+                        const uint8_t *payload, uint8_t payload_len,
+                        float rssi_dbm)
+{
+    uint8_t i;
+    bool    is_text = true;
+
+    printf("[GW] DATA from 0x%08X  rssi=%.0f dBm"
+           "  op=0x%04X  seq=%u  len=%u\n",
+           hdr->src_id, rssi_dbm, hdr->op, hdr->seq, payload_len);
+
+    if (payload_len == 0U) {
+        printf("[GW]   (empty payload)\n");
+        return;
+    }
+
+    /* Detect printable ASCII (allow trailing NUL). */
+    for (i = 0U; i < payload_len; i++) {
+        uint8_t c = payload[i];
+        if (c == 0U && i == (uint8_t)(payload_len - 1U)) break; /* trailing NUL */
+        if (c < 0x20U || c > 0x7EU) { is_text = false; break; }
+    }
+
+    if (is_text) {
+        /* Safe to print as string (NUL-terminate defensively). */
+        char tmp[256];
+        uint8_t copy_len = payload_len < 255U ? payload_len : 255U;
+        memcpy(tmp, payload, copy_len);
+        tmp[copy_len] = '\0';
+        printf("[GW]   payload: \"%s\"\n", tmp);
+    } else {
+        printf("[GW]   payload hex:");
+        for (i = 0U; i < payload_len; i++) printf(" %02X", payload[i]);
+        printf("\n");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * RX dispatch
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -639,13 +680,16 @@ static void dispatch_frame(uint32_t my_id,
         handle_time_req(my_id, &hdr, payload, hdr.length, t2_ms);
         break;
 
-    case EMESH_PACKET_TYPE_ACK:
     case EMESH_PACKET_TYPE_DATA:
+        handle_data(&hdr, payload, hdr.length, meta->rssi_dbm);
+        break;
+
+    case EMESH_PACKET_TYPE_ACK:
     case EMESH_PACKET_TYPE_NEIGHBOUR_ADV:
     case EMESH_PACKET_TYPE_REG_RESPONSE:
     case EMESH_PACKET_TYPE_TIME_RESP:
-        printf("[GW] RX type=0x%02X from 0x%08X (unhandled)\n",
-               hdr.type, hdr.src_id);
+     /* Not handled at the gateway level — log only. */
+    printf("[GW] RX type=0x%02X from 0x%08X  rssi=%.0f dBm (unhandled)\n", hdr.type, hdr.src_id, meta->rssi_dbm);
         break;
 
     default:
