@@ -450,9 +450,21 @@ static void dispatch_frame(uint32_t my_id,
     switch (hdr.type) {
 
     case EMESH_PACKET_TYPE_BEACON:
-        /* Another gateway / relay is beaconing.  Log and ignore. */
-        printf("[GW] RX Beacon   from 0x%08X  rssi=%.0f dBm  (ignored)\n",
-               hdr.src_id, meta->rssi_dbm);
+        {
+            beacon_payload_t bp;
+            if (beacon_payload_decode(payload, payload_len, &bp)) {
+                printf("[GW] RX Beacon   from 0x%08X  rssi=%.0f dBm  snr=%.1f dB  "
+                       "utc=%llu ms  stratum=%u  nodes=%u  uptime=%us  "
+                       "reg_open=%d\n",
+                       hdr.src_id, meta->rssi_dbm, meta->snr_db,
+                       (unsigned long long)bp.utc_epoch_ms,
+                       bp.stratum, bp.node_count, bp.uptime_s,
+                       (bp.net_flags & BEACON_NET_FLAG_REG_OPEN) ? 1 : 0);
+            } else {
+                printf("[GW] RX Beacon   from 0x%08X  rssi=%.0f dBm  (malformed)\n",
+                       hdr.src_id, meta->rssi_dbm);
+            }
+        }
         break;
 
     case EMESH_PACKET_TYPE_SUBSCRIPTION:

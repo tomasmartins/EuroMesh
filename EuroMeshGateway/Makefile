@@ -90,13 +90,22 @@ SRCS    := src/gateway_main.c    \
 
 OBJS    := $(SRCS:.c=.o)
 
+# ── Test tools ────────────────────────────────────────────────────────────
+TEST_SX1301      := tools/test_sx1301
+TEST_SX1301_SRCS := tools/test_sx1301.c  \
+                    src/lgw_hal.c
+TEST_SX1301_OBJS := $(TEST_SX1301_SRCS:.c=.o)
+
 # ── Default target ────────────────────────────────────────────────────────
 .PHONY: all clean install
 
-all: $(LGW_LIB) $(TARGET)
+all: $(LGW_LIB) $(TARGET) $(TEST_SX1301)
 
 $(TARGET): $(OBJS) $(LGW_LIB)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
+
+$(TEST_SX1301): $(TEST_SX1301_OBJS) $(LGW_LIB)
+	$(CC) $(TEST_SX1301_OBJS) $(LDFLAGS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -130,5 +139,6 @@ install: $(TARGET)
 # ── Clean ─────────────────────────────────────────────────────────────────
 clean:
 	$(RM) $(OBJS) $(TARGET)
+	$(RM) $(TEST_SX1301_OBJS) $(TEST_SX1301)
 	$(RM) $(LGW_OBJS) $(LGW_LIB)
 	$(RM) -r $(LGW_OBJ)

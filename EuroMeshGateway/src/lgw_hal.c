@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 /* Semtech libloragw public header. */
@@ -36,6 +37,38 @@
 
 static bool g_started = false;
 
+/* ── SX1301 GPIO reset ───────────────────────────────────────────────────── */
+
+/*
+ * Pulse the SX1301 reset line using gpioset (libgpiod userspace tool).
+ * Chip and line default to gpiochip4 / 21 (Rock Pi 4B+ + Nebra Indoor HAT,
+ * physical header PIN_15 = SX1301 NRESET, sysfs GPIO 149).
+ * Override with env vars LGW_RESET_CHIP and LGW_RESET_LINE.
+ */
+static void lgw_reset_sx1301(void)
+{
+    const char *chip = getenv("LGW_RESET_CHIP");
+    const char *line = getenv("LGW_RESET_LINE");
+    char cmd[128];
+
+    if (chip == NULL) { chip = "gpiochip4"; }
+    if (line == NULL) { line = "21"; }
+
+    printf("[lgw_hal] Resetting SX1301 via %s line %s\n", chip, line);
+
+    /* Assert reset (high) for 200 ms. */
+    snprintf(cmd, sizeof(cmd),
+             "gpioset --mode=time --usec=200000 %s %s=1", chip, line);
+    (void)system(cmd);
+    usleep(100000);
+
+    /* Deassert reset (low) for 200 ms. */
+    snprintf(cmd, sizeof(cmd),
+             "gpioset --mode=time --usec=200000 %s %s=0", chip, line);
+    (void)system(cmd);
+    usleep(100000);
+}
+
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
 bool lgw_hal_init(void)
@@ -48,6 +81,9 @@ bool lgw_hal_init(void)
     if (g_started) {
         return true; /* already initialised */
     }
+
+    /* ── Hardware reset ──────────────────────────────────────────────────── */
+    lgw_reset_sx1301();
 
     /* ── Board configuration ─────────────────────────────────────────────── */
     memset(&boardconf, 0, sizeof(boardconf));
