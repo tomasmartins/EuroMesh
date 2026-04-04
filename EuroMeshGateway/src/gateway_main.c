@@ -107,8 +107,8 @@
  */
 #define TDMA_SLOT_MS          100U
 
-/* Maximum beacon slot index (0-based; slot 0 reserved for gateway 0). */
-#define TDMA_MAX_BEACON_SLOTS   8U
+/* Total beacon slots — must match TDMA_MAX_BEACON_SLOTS in relay tdma.h. */
+#define TDMA_MAX_BEACON_SLOTS  10U
 
 /*
  * Collision window (ms): if a peer gateway's beacon is received within this
@@ -718,32 +718,60 @@ static void sig_handler(int signum)
 int main(int argc, char *argv[])
 {
     uint32_t      my_id;
-    uint64_t      next_beacon_ms;  /* UTC ms of next scheduled beacon          */
+    uint64_t      next_beacon_ms;   /* UTC ms of next scheduled beacon         */
     uint64_t      reg_close_utc_ms; /* UTC ms when reg window closes           */
-    uint64_t      last_expiry_ms;  /* monotonic ms of last periodic expiry     */
-    uint64_t      last_peer_log_ms;/* monotonic ms of last peer table printout */
+    uint64_t      last_expiry_ms;   /* monotonic ms of last periodic expiry    */
+    uint64_t      last_peer_log_ms; /* monotonic ms of last peer table log     */
     uint8_t       rx_buf[256];
     uint8_t       rx_len;
     lgw_rx_meta_t rx_meta;
     bool          reg_window_open;
     const char   *slot_env;
-
-    (void)argc;
-    (void)argv;
+    int           i;
 
     /* ── Signal handlers ─────────────────────────────────────────────────── */
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
-    /* ── Beacon slot ─────────────────────────────────────────────────────── */
+    /* ── Beacon slot selection ───────────────────────────────────────────── */
+    /*
+     * Priority order:
+     *   1. --slot N  command-line argument
+     *   2. EUROMESH_BEACON_SLOT environment variable
+     *   3. Random slot chosen at startup (default)
+     *
+     * Random selection prevents two gateways that boot simultaneously from
+     * both landing on slot 0 before the collision-detection logic can run.
+     * They would be transmitting at the same instant and therefore unable to
+     * hear each other's beacon, so the collision would never be detected.
+     * Picking a random slot at startup avoids that race entirely.
+     */
+    srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+    g_my_beacon_slot = (uint8_t)((unsigned int)rand() % TDMA_MAX_BEACON_SLOTS);
+
     slot_env = getenv("EUROMESH_BEACON_SLOT");
     if (slot_env != NULL) {
         int slot_val = atoi(slot_env);
         if (slot_val >= 0 && slot_val < (int)TDMA_MAX_BEACON_SLOTS) {
             g_my_beacon_slot = (uint8_t)slot_val;
         } else {
-            fprintf(stderr, "[GW] Invalid EUROMESH_BEACON_SLOT=%s — using 0\n",
+            fprintf(stderr,
+                    "[GW] Invalid EUROMESH_BEACON_SLOT=%s — using random\n",
                     slot_env);
+        }
+    }
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
+            int s = atoi(argv[i + 1]);
+            if (s >= 0 && s < (int)TDMA_MAX_BEACON_SLOTS) {
+                g_my_beacon_slot = (uint8_t)s;
+            } else {
+                fprintf(stderr,
+                        "[GW] --slot %d out of range [0,%u] — using random\n",
+                        s, (unsigned int)(TDMA_MAX_BEACON_SLOTS - 1U));
+            }
+            i++;
         }
     }
 
