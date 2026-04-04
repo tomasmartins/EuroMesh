@@ -20,6 +20,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <WiFi.h>
 #include <RadioLib.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -284,6 +285,8 @@ static void sendTestPacket() {
     lastTxMs = millis();
     txCount++;
 
+    // Re-apply IQ setting — transmit() may reset radio config
+    radio.invertIQ(false);
     radio.startReceive();
     radioMode = RadioMode::RX;
 
@@ -300,7 +303,10 @@ static void sendTestPacket() {
 // ── Process a received packet ─────────────────────────────────────────────
 static void handlePacket() {
     size_t  len = radio.getPacketLength();
-    if (len == 0 || len > 255) return;
+    if (len == 0 || len > 255) {
+        Serial.printf("[RX] bad len=%u\n", (unsigned)len);
+        return;
+    }
 
     uint8_t buf[255];
     int16_t err  = radio.readData(buf, len);
@@ -308,18 +314,36 @@ static void handlePacket() {
     float   snr  = radio.getSNR();
 
     if (err == RADIOLIB_ERR_CRC_MISMATCH) {
-        Serial.printf("[RX] CRC error RSSI=%.1f\n", rssi);
+        Serial.printf("[RX] CRC error  len=%u  rssi=%.1fdBm\n", (unsigned)len, rssi);
         return;
     }
     if (err != RADIOLIB_ERR_NONE) {
-        Serial.printf("[RX] readData err=%d\n", err);
+        Serial.printf("[RX] readData err=%d  len=%u\n", err, (unsigned)len);
         return;
     }
-    if (len < EMESH_HEADER_SIZE + BEACON_PAYLOAD_MIN) return;
-    if (buf[0] != EMESH_TYPE_BEACON)                  return;
+
+    // Print raw frame summary for all received frames
+    Serial.printf("[RX] len=%u  rssi=%.1fdBm  snr=%.1fdB  type=0x%02X  "
+                  "src=0x%02X%02X%02X%02X  flags=0x%02X\n",
+                  (unsigned)len, rssi, snr, buf[0],
+                  buf[6], buf[5], buf[4], buf[3], buf[1]);
+
+    if (len < EMESH_HEADER_SIZE + BEACON_PAYLOAD_MIN) {
+        Serial.printf("[RX] too short for beacon (%u < %u) — ignored\n",
+                      (unsigned)len,
+                      (unsigned)(EMESH_HEADER_SIZE + BEACON_PAYLOAD_MIN));
+        return;
+    }
+    if (buf[0] != EMESH_TYPE_BEACON) {
+        Serial.printf("[RX] not a beacon (type=0x%02X) — ignored\n", buf[0]);
+        return;
+    }
 
     const uint8_t *p = buf + EMESH_HEADER_SIZE;
-    if (p[0] != EMESH_TYPE_BEACON) return;
+    if (p[0] != EMESH_TYPE_BEACON) {
+        Serial.printf("[RX] beacon payload type mismatch (p[0]=0x%02X) — ignored\n", p[0]);
+        return;
+    }
 
     BeaconInfo b = {};
     b.src_id   = u32le(buf + 3);
@@ -383,6 +407,10 @@ void setup() {
     tft.setTextSize(1); tft.setTextColor(CLR_CYAN);
     char idbuf[20]; snprintf(idbuf, sizeof(idbuf), "ID 0x%08X", (unsigned)NODE_ID);
     tft.setCursor(56, 134); tft.print(idbuf);
+
+    // Disable WiFi and BT — not needed, saves ~80 mA
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[Power] WiFi off");
 
     // PMU
     Wire.begin(PMU_SDA, PMU_SCL);
@@ -463,6 +491,7 @@ void loop() {
     if (radioMode == RadioMode::RX && radio.available()) {
         handlePacket();
         // Always restart receive after reading (in case it didn't auto-restart)
+        radio.invertIQ(false);
         radio.startReceive();
     }
 }
