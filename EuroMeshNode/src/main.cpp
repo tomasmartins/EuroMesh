@@ -46,6 +46,8 @@ static constexpr int LORA_NSS  = 5;
 static constexpr int LORA_RST  = 8;
 static constexpr int LORA_DIO1 = 9;
 static constexpr int LORA_BUSY = 7;
+static constexpr uint8_t TOUCH_I2C_ADDR = 0x15; // CST816S/CST816T (T-Watch-S3)
+static constexpr uint8_t DRV2605_I2C_ADDR = 0x5A;
 
 // ── Radio parameters ──────────────────────────────────────────────────────
 static constexpr float    FREQ_MHZ      = 869.525f;
@@ -105,6 +107,22 @@ static uint32_t milliBase     = 0;   // millis() at last beacon sync
 static uint16_t txSeq         = 0;
 static uint32_t txCount       = 0;
 static uint16_t rxSeq         = 0;  // seq of last received beacon
+static uint8_t  lowBattHits   = 0;  // debounce for low-battery sleep
+static bool     subscribed    = false;
+static uint32_t lastTouchMs   = 0;
+static bool     hapticOk      = false;
+
+struct TouchPoint {
+    bool     pressed;
+    uint16_t x;
+    uint16_t y;
+};
+
+struct Rect {
+    int16_t x, y, w, h;
+};
+
+static constexpr Rect SUBSCRIBE_BTN = {170, 214, 64, 22};
 
 struct BeaconInfo {
     uint32_t src_id;
@@ -140,21 +158,21 @@ static inline void put_u32le(uint8_t *b, uint32_t v) {
 // ── Display ───────────────────────────────────────────────────────────────
 static void drawHeader() {
     tft.fillRect(0, 0, 240, 30, CLR_HEADER);
-    tft.setTextSize(2); tft.setTextColor(CLR_TEXT);
+    tft.setTextSize(1); tft.setTextColor(CLR_TEXT);
     if (utcBaseMs > 0) {
         uint64_t nowUtcMs = utcBaseMs + (uint64_t)(millis() - milliBase);
         time_t   t        = (time_t)(nowUtcMs / 1000ULL);
         struct tm *tm_utc = gmtime(&t);
-        char timeBuf[9];
-        snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+        char timeBuf[24];
+        snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:%02d:%02d",
+                 tm_utc->tm_year + 1900, tm_utc->tm_mon + 1, tm_utc->tm_mday,
                  tm_utc->tm_hour, tm_utc->tm_min, tm_utc->tm_sec);
-        tft.setCursor(6, 7); tft.print(timeBuf);
-        // Node ID (last 4 hex digits), centred in the gap between time and battery
-        char idBuf[7];
-        snprintf(idBuf, sizeof(idBuf), "#%04X", (unsigned)(NODE_ID & 0xFFFFu));
-        tft.setCursor(109, 7); tft.print(idBuf);
+        tft.setCursor(6, 3); tft.print(timeBuf);
+        char idBuf[12];
+        snprintf(idBuf, sizeof(idBuf), "Node #%04X", (unsigned)(NODE_ID & 0xFFFFu));
+        tft.setCursor(6, 17); tft.print(idBuf);
     } else {
-        tft.setCursor(6, 7); tft.print("EuroMesh Node");
+        tft.setCursor(6, 10); tft.print("EuroMesh Node (no UTC)");
     }
 
     if (!pmuOk) return;
@@ -167,7 +185,7 @@ static void drawHeader() {
     char buf[10];
     snprintf(buf, sizeof(buf), (chg && !criticalLow) ? "CHG" : "%.2fV", batV);
     tft.setTextColor(col);
-    tft.setCursor(240 - (int16_t)(strlen(buf)*12) - 4, 7);
+    tft.setCursor(240 - (int16_t)(strlen(buf)*6) - 4, 10);
     tft.print(buf);
 }
 
@@ -259,9 +277,11 @@ static void drawTxBar() {
     // Bottom 30 px: TX status bar
     tft.fillRect(0, 210, 240, 30, CLR_TX_HDR);
     tft.setTextSize(1); tft.setTextColor(CLR_YELLOW, CLR_TX_HDR);
-    char buf[40];
+    char buf[42];
     uint32_t age = txCount > 0 ? (millis() - lastTxMs)/1000u : 0;
-    if (txCount == 0) {
+    if (!subscribed) {
+        snprintf(buf, sizeof(buf), "TX LOCKED");
+    } else if (txCount == 0) {
         snprintf(buf, sizeof(buf), "TX: waiting (in %us)",
                  TX_INTERVAL_S - (millis()/1000u % TX_INTERVAL_S));
     } else {
@@ -269,6 +289,92 @@ static void drawTxBar() {
                  txSeq, age, (unsigned)txCount);
     }
     tft.setCursor(4, 218); tft.print(buf);
+
+    // Touch button shown only while unsubscribed
+    if (!subscribed) {
+        tft.drawRoundRect(SUBSCRIBE_BTN.x, SUBSCRIBE_BTN.y,
+                          SUBSCRIBE_BTN.w, SUBSCRIBE_BTN.h, 4, CLR_GREEN);
+        tft.setTextColor(CLR_GREEN, CLR_TX_HDR);
+        tft.setCursor(SUBSCRIBE_BTN.x + 15, SUBSCRIBE_BTN.y + 7);
+        tft.print("JOIN");
+    }
+}
+
+static bool insideRect(uint16_t x, uint16_t y, const Rect &r) {
+    return (x >= (uint16_t)r.x) && (x < (uint16_t)(r.x + r.w)) &&
+           (y >= (uint16_t)r.y) && (y < (uint16_t)(r.y + r.h));
+}
+
+static bool i2cReadReg(uint8_t addr, uint8_t reg, uint8_t *dst, uint8_t len) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    uint8_t n = Wire.requestFrom((int)addr, (int)len);
+    if (n != len) return false;
+    for (uint8_t i = 0; i < len; ++i) dst[i] = Wire.read();
+    return true;
+}
+
+static bool i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+static bool initDrv2605() {
+    // DRV2605: internal trigger mode + 1-click waveform sequence.
+    // Register map:
+    // 0x01 MODE, 0x02 RTP_INPUT, 0x03 LIB_SEL, 0x04.. WAVESEQ, 0x0C GO.
+    bool ok = true;
+    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x01, 0x00); // MODE: internal trigger
+    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x02, 0x00); // RTP_INPUT: unused
+    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x03, 0x01); // LIB_SEL: library 1
+    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x1A, 0xB6); // FEEDBACK: ERM defaults
+    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x04, 0x47); // Waveform slot #1
+    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x05, 0x00); // End of sequence
+    return ok;
+}
+
+static void hapticPulse() {
+    if (!hapticOk) return;
+    // GO register: 1 starts playback of configured waveform.
+    i2cWriteReg(DRV2605_I2C_ADDR, 0x0C, 0x01);
+}
+
+static TouchPoint readTouchPoint() {
+    // CST816: reg 0x02 = number of touch points, 0x03..0x06 = XH, XL, YH, YL
+    uint8_t pcount = 0;
+    if (!i2cReadReg(TOUCH_I2C_ADDR, 0x02, &pcount, 1) || pcount == 0) {
+        return {false, 0, 0};
+    }
+
+    uint8_t xy[4];
+    if (!i2cReadReg(TOUCH_I2C_ADDR, 0x03, xy, 4)) {
+        return {false, 0, 0};
+    }
+
+    uint16_t x = ((uint16_t)(xy[0] & 0x0F) << 8) | xy[1];
+    uint16_t y = ((uint16_t)(xy[2] & 0x0F) << 8) | xy[3];
+
+    // Display rotation is 2, so mirror touch coordinates.
+    if (x < 240 && y < 240) {
+        x = 239 - x;
+        y = 239 - y;
+    }
+
+    return {true, x, y};
+}
+
+static bool startReceiveSafe() {
+    radio.invertIQ(false);  // keep gateway-matching IQ mode
+    int16_t err = radio.startReceive();
+    if (err != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Radio] startReceive() failed: %d\n", err);
+        return false;
+    }
+    radioMode = RadioMode::RX;
+    return true;
 }
 
 // ── Build and transmit a test DATA frame ──────────────────────────────────
@@ -303,10 +409,8 @@ static void sendTestPacket() {
     lastTxMs = millis();
     txCount++;
 
-    // Re-apply IQ setting — transmit() may reset radio config
-    radio.invertIQ(false);
-    radio.startReceive();
-    radioMode = RadioMode::RX;
+    // Re-enter continuous RX after TX
+    startReceiveSafe();
 
     if (err == RADIOLIB_ERR_NONE) {
         Serial.printf("[TX] DATA  src=0x%08X  seq=%u  payload=\"%s\"\n",
@@ -438,6 +542,9 @@ void setup() {
     Wire.begin(PMU_SDA, PMU_SCL);
     pmuOk = pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
     Serial.printf("[PMU] AXP2101 %s\n", pmuOk ? "OK" : "not found");
+    hapticOk = initDrv2605();
+    Serial.printf("[HAPTIC] DRV2605 %s (0x%02X)\n",
+                  hapticOk ? "OK" : "init failed", DRV2605_I2C_ADDR);
 
     // LoRa (HSPI / SPI3)
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -462,10 +569,10 @@ void setup() {
     Serial.printf("[Radio] %.3f MHz  SF%d  BW%.0f kHz  CR4/%d  SW=0x%02X\n",
                   FREQ_MHZ, SF, BW_KHZ, CR, SYNC_WORD);
     Serial.printf("[TX] Will send DATA every %u s\n", TX_INTERVAL_S);
+    Serial.println("[TX] Subscription disabled on boot. Tap JOIN on touchscreen.");
 
     radio.invertIQ(false);  // non-inverted — matches gateway
-    radio.startReceive();
-    radioMode = RadioMode::RX;
+    startReceiveSafe();
 
     // Full initial display
     tft.fillScreen(CLR_BG);
@@ -482,6 +589,20 @@ static uint32_t lastAgeMs = 0;
 void loop() {
     uint32_t now = millis();
 
+    // ── Touchscreen JOIN button ─────────────────────────────────────────
+    if (!subscribed && (now - lastTouchMs) > 60u) {
+        lastTouchMs = now;
+        TouchPoint tp = readTouchPoint();
+        if (tp.pressed && insideRect(tp.x, tp.y, SUBSCRIBE_BTN)) {
+            subscribed = true;
+            lastTxMs = now;  // start interval countdown from subscription time
+            Serial.printf("[TX] Subscribed via touch @ (%u,%u): periodic TX enabled.\n",
+                          tp.x, tp.y);
+            hapticPulse();
+            drawTxBar();
+        }
+    }
+
     // ── PMU header refresh every 5 s ─────────────────────────────────────
     if (pmuOk && (now - lastPmuMs > 5000u)) {
         lastPmuMs = now;
@@ -489,14 +610,21 @@ void loop() {
 
         // ── Low-battery radio power save ─────────────────────────────────
         float batV = pmu.getBattVoltage() / 1000.0f;
-        if (batV < 3.0f && radioMode != RadioMode::SLEEP) {
+        if (batV > 2.0f && batV < 3.0f) {
+            if (lowBattHits < 255) lowBattHits++;
+        } else {
+            lowBattHits = 0;
+        }
+
+        // Debounce low-battery protection to avoid false PMU reads that can
+        // permanently park the radio after one good packet.
+        if (lowBattHits >= 3 && radioMode != RadioMode::SLEEP) {
             radio.sleep();
             radioMode = RadioMode::SLEEP;
-            Serial.println("[Radio] Sleeping — battery critical (<3.0V)");
+            Serial.printf("[Radio] Sleeping — battery critical (%.2fV)\n", batV);
         } else if (batV >= 3.1f && radioMode == RadioMode::SLEEP) {
-            radio.startReceive();
-            radioMode = RadioMode::RX;
-            Serial.println("[Radio] Woke — battery recovered (>=3.1V)");
+            if (startReceiveSafe())
+                Serial.printf("[Radio] Woke — battery recovered (%.2fV)\n", batV);
         }
     }
 
@@ -517,7 +645,8 @@ void loop() {
     }
 
     // ── Periodic TX ──────────────────────────────────────────────────────
-    if (radioMode != RadioMode::SLEEP && (now - lastTxMs) >= TX_INTERVAL_S * 1000u) {
+    if (subscribed && radioMode != RadioMode::SLEEP &&
+        (now - lastTxMs) >= TX_INTERVAL_S * 1000u) {
         sendTestPacket();
     }
 
@@ -525,7 +654,6 @@ void loop() {
     if (radioMode == RadioMode::RX && radio.available()) {
         handlePacket();
         // Always restart receive after reading (in case it didn't auto-restart)
-        radio.invertIQ(false);
-        radio.startReceive();
+        startReceiveSafe();
     }
 }
