@@ -827,7 +827,7 @@ int main(int argc, char *argv[])
 
         /* ── RX poll ─────────────────────────────────────────────────────── */
         rx_len = 0U;
-        if (lgw_hal_receive(rx_buf, (uint8_t)sizeof(rx_buf),
+        if (lgw_hal_receive(rx_buf, (uint16_t)sizeof(rx_buf),
                             &rx_len, &rx_meta)) {
             dispatch_frame(my_id, rx_buf, rx_len, &rx_meta, reg_window_open);
         } else {

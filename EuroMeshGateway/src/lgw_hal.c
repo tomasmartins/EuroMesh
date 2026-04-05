@@ -166,7 +166,7 @@ void lgw_hal_stop(void)
 
 /* ── Frame I/O ───────────────────────────────────────────────────────────── */
 
-bool lgw_hal_receive(uint8_t *buf, uint8_t buf_capacity,
+bool lgw_hal_receive(uint8_t *buf, uint16_t buf_capacity,
                      uint8_t *len_out, lgw_rx_meta_t *meta)
 {
     struct lgw_pkt_rx_s rxpkt[4]; /* fetch up to 4 queued packets per call  */

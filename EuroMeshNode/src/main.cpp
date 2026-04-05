@@ -21,6 +21,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <time.h>
 #include <RadioLib.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -92,13 +93,15 @@ bool             pmuOk = false;
 static uint32_t NODE_ID = 0;
 
 // ── Radio state ───────────────────────────────────────────────────────────
-enum class RadioMode { RX, TX };
+enum class RadioMode { RX, TX, SLEEP };
 static RadioMode radioMode = RadioMode::RX;
 
 // ── State ─────────────────────────────────────────────────────────────────
 static uint32_t lastBeaconMs  = 0;
 static uint32_t lastTxMs      = 0;
 static bool     beaconSeen    = false;
+static uint64_t utcBaseMs     = 0;   // UTC epoch ms at last beacon sync
+static uint32_t milliBase     = 0;   // millis() at last beacon sync
 static uint16_t txSeq         = 0;
 static uint32_t txCount       = 0;
 static uint16_t rxSeq         = 0;  // seq of last received beacon
@@ -138,16 +141,31 @@ static inline void put_u32le(uint8_t *b, uint32_t v) {
 static void drawHeader() {
     tft.fillRect(0, 0, 240, 30, CLR_HEADER);
     tft.setTextSize(2); tft.setTextColor(CLR_TEXT);
-    tft.setCursor(6, 7); tft.print("EuroMesh Node");
+    if (utcBaseMs > 0) {
+        uint64_t nowUtcMs = utcBaseMs + (uint64_t)(millis() - milliBase);
+        time_t   t        = (time_t)(nowUtcMs / 1000ULL);
+        struct tm *tm_utc = gmtime(&t);
+        char timeBuf[9];
+        snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+                 tm_utc->tm_hour, tm_utc->tm_min, tm_utc->tm_sec);
+        tft.setCursor(6, 7); tft.print(timeBuf);
+        // Node ID (last 4 hex digits), centred in the gap between time and battery
+        char idBuf[7];
+        snprintf(idBuf, sizeof(idBuf), "#%04X", (unsigned)(NODE_ID & 0xFFFFu));
+        tft.setCursor(109, 7); tft.print(idBuf);
+    } else {
+        tft.setCursor(6, 7); tft.print("EuroMesh Node");
+    }
 
     if (!pmuOk) return;
     bool    chg  = pmu.isCharging();
     float   batV = pmu.getBattVoltage() / 1000.0f;
-    uint16_t col = chg ? CLR_CYAN
+    bool criticalLow = batV < 3.0f;
+    uint16_t col = (chg && !criticalLow) ? CLR_CYAN
                  : (batV > 3.9f ? CLR_GREEN
                  : (batV > 3.5f ? CLR_ORANGE : CLR_RED));
     char buf[10];
-    snprintf(buf, sizeof(buf), chg ? "CHG" : "%.2fV", batV);
+    snprintf(buf, sizeof(buf), (chg && !criticalLow) ? "CHG" : "%.2fV", batV);
     tft.setTextColor(col);
     tft.setCursor(240 - (int16_t)(strlen(buf)*12) - 4, 7);
     tft.print(buf);
@@ -364,6 +382,10 @@ static void handlePacket() {
     last         = b;
     lastBeaconMs = millis();
     beaconSeen   = true;
+    if (b.utc_ms > 0) {
+        utcBaseMs = b.utc_ms;
+        milliBase = lastBeaconMs;
+    }
 
     Serial.printf("[BEACON] src=0x%08X  rssi=%.1fdBm  snr=%.1fdB"
                   "  stratum=%u  reg=%s\n",
@@ -464,6 +486,18 @@ void loop() {
     if (pmuOk && (now - lastPmuMs > 5000u)) {
         lastPmuMs = now;
         drawHeader();
+
+        // ── Low-battery radio power save ─────────────────────────────────
+        float batV = pmu.getBattVoltage() / 1000.0f;
+        if (batV < 3.0f && radioMode != RadioMode::SLEEP) {
+            radio.sleep();
+            radioMode = RadioMode::SLEEP;
+            Serial.println("[Radio] Sleeping — battery critical (<3.0V)");
+        } else if (batV >= 3.1f && radioMode == RadioMode::SLEEP) {
+            radio.startReceive();
+            radioMode = RadioMode::RX;
+            Serial.println("[Radio] Woke — battery recovered (>=3.1V)");
+        }
     }
 
     // ── Age fields refresh every 1 s ─────────────────────────────────────
@@ -483,7 +517,7 @@ void loop() {
     }
 
     // ── Periodic TX ──────────────────────────────────────────────────────
-    if ((now - lastTxMs) >= TX_INTERVAL_S * 1000u) {
+    if (radioMode != RadioMode::SLEEP && (now - lastTxMs) >= TX_INTERVAL_S * 1000u) {
         sendTestPacket();
     }
 

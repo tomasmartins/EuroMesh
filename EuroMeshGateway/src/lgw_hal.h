@@ -66,7 +66,7 @@ void lgw_hal_stop(void);
  *
  * buf_capacity must be at least 256 bytes (maximum LoRa payload for SX1301).
  */
-bool lgw_hal_receive(uint8_t *buf, uint8_t buf_capacity,
+bool lgw_hal_receive(uint8_t *buf, uint16_t buf_capacity,
                      uint8_t *len_out, lgw_rx_meta_t *meta);
 
 /*
