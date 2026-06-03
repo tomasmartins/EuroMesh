@@ -16,9 +16,10 @@
 CC      ?= gcc
 AR      ?= ar
 
-# ── Default target (must appear before any other rule) ────────────────────
+# Override the default goal so that plain 'make' builds 'all' regardless of
+# where the 'all' rule appears relative to the first explicit rule in the file.
+.DEFAULT_GOAL := all
 .PHONY: all clean install
-all: $(LGW_LIB) $(TARGET) $(TEST_SX1301)
 
 # ── libloragw (bundled Semtech HAL) ───────────────────────────────────────
 LGW_DIR   := libloragw
@@ -102,6 +103,8 @@ TEST_SX1301      := tools/test_sx1301
 TEST_SX1301_SRCS := tools/test_sx1301.c  \
                     src/lgw_hal.c
 TEST_SX1301_OBJS := $(TEST_SX1301_SRCS:.c=.o)
+
+all: $(LGW_LIB) $(TARGET) $(TEST_SX1301)
 
 $(TARGET): $(OBJS) $(LGW_LIB)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
