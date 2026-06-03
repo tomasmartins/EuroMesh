@@ -29,7 +29,11 @@ extern "C" {
 #define GW_LORA_PEERS_MAX  8U
 
 /*
- * Entry for one peer gateway heard via LoRa.
+ * Entry for one peer gateway in range.
+ *
+ * Entries are created either from a received beacon (update) or from a
+ * received LOCATION_ADV (set_location).  A peer heard only via LOCATION_ADV
+ * will have rssi_dbm = 0 and rx_utc_ms = 0 until a beacon is also received.
  *
  * rx_utc_ms: UTC timestamp (ms) of the most recently received beacon from
  *            this peer.  Used together with the local gateway's own beacon
@@ -44,6 +48,13 @@ typedef struct {
     time_t   first_seen;    /* wall-clock time of first reception              */
     time_t   last_seen;     /* wall-clock time of last reception               */
     uint64_t rx_utc_ms;     /* UTC ms of last beacon (for collision detection) */
+    /* ── Geographic location (from LOCATION_ADV) ─────────────────────────── */
+    bool     loc_valid;     /* true once a LOCATION_ADV has been received      */
+    bool     loc_gps;       /* true = live GPS fix; false = manually set       */
+    double   lat_deg;       /* latitude  in decimal degrees                    */
+    double   lon_deg;       /* longitude in decimal degrees                    */
+    float    alt_m;         /* altitude in metres above WGS-84                 */
+    time_t   loc_updated;   /* wall-clock time location was last refreshed     */
 } gw_lora_peer_t;
 
 /* ── Lifecycle ────────────────────────────────────────────────────────────── */
@@ -75,6 +86,18 @@ const gw_lora_peer_t  *gw_lora_peers_get(uint8_t idx);
  * of our_beacon_utc_ms.  Used to detect a collision on the same TDMA slot.
  */
 bool gw_lora_peers_collision(uint64_t our_beacon_utc_ms, uint32_t delta_ms);
+
+/* ── Location ─────────────────────────────────────────────────────────────── */
+
+/*
+ * Store or update the geographic location of a peer gateway.
+ * Creates a new entry if gw_id is not already in the table (this handles
+ * peers that announce location before their beacon is received, e.g. a
+ * secondary gateway that sends LOCATION_ADV right after registration).
+ */
+void gw_lora_peers_set_location(uint32_t gw_id,
+                                  double lat_deg, double lon_deg, float alt_m,
+                                  bool gps_valid);
 
 /* ── Expiry ───────────────────────────────────────────────────────────────── */
 

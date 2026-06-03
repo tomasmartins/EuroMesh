@@ -57,6 +57,13 @@ typedef struct {
 bool    sub_request_decode(const uint8_t *buf, uint8_t length, sub_request_t *out);
 uint8_t reg_response_encode(const reg_response_t *resp, uint8_t *buf, uint8_t capacity);
 
+/*
+ * Decode a REG_RESPONSE payload (8 bytes) into *out.
+ * Used by a gateway acting as a client (registering with an upstream gateway).
+ * Returns false if buf is NULL, too short, or the type byte mismatches.
+ */
+bool    reg_response_decode(const uint8_t *buf, uint8_t length, reg_response_t *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -129,6 +129,35 @@ bool gw_lora_peers_collision(uint64_t our_beacon_utc_ms, uint32_t delta_ms)
     return false;
 }
 
+void gw_lora_peers_set_location(uint32_t gw_id,
+                                  double lat_deg, double lon_deg, float alt_m,
+                                  bool gps_valid)
+{
+    uint8_t idx = peer_find(gw_id);
+    time_t  now = time(NULL);
+
+    if (idx == GW_LORA_PEERS_MAX) {
+        /* Not in table — create a location-only entry. */
+        if (g_count < GW_LORA_PEERS_MAX) {
+            idx = g_count++;
+        } else {
+            idx = peer_oldest();
+            printf("[GW-PEERS] Table full — evicting 0x%08X for location of "
+                   "0x%08X\n", g_peers[idx].gw_id, gw_id);
+        }
+        g_peers[idx].gw_id      = gw_id;
+        g_peers[idx].first_seen = now;
+        g_peers[idx].last_seen  = now;
+    }
+
+    g_peers[idx].loc_valid  = true;
+    g_peers[idx].loc_gps    = gps_valid;
+    g_peers[idx].lat_deg    = lat_deg;
+    g_peers[idx].lon_deg    = lon_deg;
+    g_peers[idx].alt_m      = alt_m;
+    g_peers[idx].loc_updated = now;
+}
+
 uint8_t gw_lora_peers_expire(time_t timeout_s)
 {
     time_t  now     = time(NULL);
@@ -154,11 +183,13 @@ uint8_t gw_lora_peers_expire(time_t timeout_s)
 void gw_lora_peers_print(void)
 {
     uint8_t i;
+    time_t  now = time(NULL);
+
     if (g_count == 0U) {
-        printf("[GW-PEERS] No peer gateways heard\n");
+        printf("[GW-PEERS] No peer gateways known\n");
         return;
     }
-    printf("[GW-PEERS] %u peer gateway(s) in range:\n", g_count);
+    printf("[GW-PEERS] %u peer gateway(s):\n", g_count);
     for (i = 0U; i < g_count; i++) {
         printf("[GW-PEERS]   [%u] 0x%08X  rssi=%.0f dBm  snr=%.1f dB  "
                "stratum=%u  nodes=%u  last_seen=%lds ago\n",
@@ -168,6 +199,15 @@ void gw_lora_peers_print(void)
                g_peers[i].snr_db,
                g_peers[i].stratum,
                g_peers[i].node_count,
-               (long)(time(NULL) - g_peers[i].last_seen));
+               (long)(now - g_peers[i].last_seen));
+        if (g_peers[i].loc_valid) {
+            printf("[GW-PEERS]         loc=%.6f,%.6f  alt=%.1fm  "
+                   "%s  updated=%lds ago\n",
+                   g_peers[i].lat_deg,
+                   g_peers[i].lon_deg,
+                   (double)g_peers[i].alt_m,
+                   g_peers[i].loc_gps ? "GPS" : "manual",
+                   (long)(now - g_peers[i].loc_updated));
+        }
     }
 }

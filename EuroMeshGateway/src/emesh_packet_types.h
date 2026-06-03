@@ -24,6 +24,7 @@ extern "C" {
 #define EMESH_PACKET_TYPE_REG_RESPONSE  0x06U  /* registration response         */
 #define EMESH_PACKET_TYPE_TIME_REQ      0x07U  /* two-way time sync request     */
 #define EMESH_PACKET_TYPE_TIME_RESP     0x08U  /* two-way time sync response    */
+#define EMESH_PACKET_TYPE_LOCATION_ADV  0x09U  /* geographic location broadcast */
 
 /* ── Op-field class codes (high byte of the 16-bit op field) ─────────────── */
 #define EMESH_OP_CLASS_MESH        0x00U  /* mesh control (reg, time, routing) */
@@ -36,11 +37,12 @@ extern "C" {
     ((uint16_t)(((uint16_t)(uint8_t)(cls) << 8) | (uint8_t)(cmd)))
 
 /* ── Well-known op codes (EMESH_OP_CLASS_MESH) ───────────────────────────── */
-#define EMESH_OP_MESH_BEACON      EMESH_OP(EMESH_OP_CLASS_MESH, 0x01U)
-#define EMESH_OP_MESH_REGISTER    EMESH_OP(EMESH_OP_CLASS_MESH, 0x02U)
-#define EMESH_OP_MESH_TIME_REQ    EMESH_OP(EMESH_OP_CLASS_MESH, 0x03U)
-#define EMESH_OP_MESH_TIME_RESP   EMESH_OP(EMESH_OP_CLASS_MESH, 0x04U)
-#define EMESH_OP_MESH_NB_ADV      EMESH_OP(EMESH_OP_CLASS_MESH, 0x05U)
+#define EMESH_OP_MESH_BEACON          EMESH_OP(EMESH_OP_CLASS_MESH, 0x01U)
+#define EMESH_OP_MESH_REGISTER        EMESH_OP(EMESH_OP_CLASS_MESH, 0x02U)
+#define EMESH_OP_MESH_TIME_REQ        EMESH_OP(EMESH_OP_CLASS_MESH, 0x03U)
+#define EMESH_OP_MESH_TIME_RESP       EMESH_OP(EMESH_OP_CLASS_MESH, 0x04U)
+#define EMESH_OP_MESH_NB_ADV          EMESH_OP(EMESH_OP_CLASS_MESH, 0x05U)
+#define EMESH_OP_MESH_LOCATION_ADV    EMESH_OP(EMESH_OP_CLASS_MESH, 0x06U)
 
 #ifdef __cplusplus
 }

@@ -57,7 +57,9 @@
 #include "emesh_packet_types.h"
 #include "gw_lora_peers.h"
 #include "gw_registration.h"
+#include "gw_upstream.h"
 #include "lgw_hal.h"
+#include "location_adv.h"
 #include "time_sync.h"       /* TIME_SYNC_FLAG_* constants only */
 #include "time_twoway.h"
 
@@ -108,7 +110,7 @@
 #define TDMA_SLOT_MS          100U
 
 /* Total beacon slots — must match TDMA_MAX_BEACON_SLOTS in relay tdma.h. */
-#define TDMA_MAX_BEACON_SLOTS  10U
+#define TDMA_MAX_BEACON_SLOTS   8U
 
 /*
  * Collision window (ms): if a peer gateway's beacon is received within this
@@ -117,7 +119,7 @@
 #define GW_COLLISION_WINDOW_MS  (TDMA_SLOT_MS / 2U)  /* 50 ms */
 
 /* Peer gateway timeout: remove if not heard for this many seconds. */
-#define GW_PEER_TIMEOUT_S     (BEACON_INTERVAL_S * 3U)  /* 3 missed beacons */
+#define GW_PEER_TIMEOUT_S     1920U  /* 32 minutes */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Node registry
@@ -139,16 +141,52 @@ typedef struct {
     uint8_t  beacon_slot;     /* TDMA beacon slot, 0xFF = none */
     uint8_t  hop_count;       /* 1 = direct, 2+ = via relay(s) */
     uint8_t  _pad;
-    float    last_rssi_dbm;
+    float    last_rssi_dbm;   /* RSSI of last received frame (dBm)            */
     time_t   first_seen;
     time_t   last_seen;
     time_t   last_reg;        /* timestamp of last SUBSCRIPTION */
+    /*
+     * Geographic location.
+     * loc_valid is set when the node itself broadcasts a LOCATION_ADV.
+     * last_rssi_dbm is always updated and used by the gateway to contribute
+     * an RSSI observation for RSSI-based trilateration (see location_adv.h).
+     */
+    bool     loc_valid;
+    bool     loc_gps;         /* true = live GPS; false = manual / inferred   */
+    double   lat_deg;
+    double   lon_deg;
+    float    alt_m;
+    time_t   loc_updated;
 } gw_node_entry_t;
 
 static gw_node_entry_t g_nodes[REG_MAX_NODES];
 static uint8_t         g_node_count      = 0U;
-/* Next relay slot to allocate (starts at TDMA_RELAY_SLOT_BASE). */
-static uint8_t         g_next_relay_slot = TDMA_RELAY_SLOT_BASE;
+/*
+ * Allocate the lowest available relay/gateway beacon slot by scanning the
+ * existing node table.  This correctly reclaims slots freed by expiry or
+ * swap-remove without needing a separate counter.
+ * Returns TDMA_NO_SLOT_ASSIGNED (0xFF) if all slots are taken.
+ */
+static uint8_t alloc_relay_slot(void)
+{
+    uint8_t slot;
+    uint8_t i;
+    bool    in_use;
+
+    for (slot = TDMA_RELAY_SLOT_BASE; slot < TDMA_MAX_BEACON_SLOTS; slot++) {
+        in_use = false;
+        for (i = 0U; i < g_node_count; i++) {
+            if (g_nodes[i].beacon_slot == slot) {
+                in_use = true;
+                break;
+            }
+        }
+        if (!in_use) {
+            return slot;
+        }
+    }
+    return TDMA_NO_SLOT_ASSIGNED; /* all slots taken */
+}
 
 /* ── Look-up ─────────────────────────────────────────────────────────────── */
 
@@ -256,6 +294,19 @@ static uint16_t g_beacon_seq   = 0U;
 static uint16_t g_resp_seq     = 0U;
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Gateway location (optional; set via --lat / --lon / --alt CLI args)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    bool   valid;
+    double lat_deg;
+    double lon_deg;
+    float  alt_m;
+} gw_location_t;
+
+static gw_location_t g_location = { false, 0.0, 0.0, 0.0f };
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Beacon TX
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -282,16 +333,23 @@ static void send_beacon(uint32_t my_id, uint64_t boot_mono_ms)
     bp.sync_flags   = TIME_SYNC_FLAG_UTC_VALID;
     bp.utc_epoch_ms = now_ms_utc;
     bp.pps_tick_ms  = 0U;
-    bp.stratum      = EMESH_STRATUM_GPS;      /* 0 — authoritative             */
+    bp.stratum      = gw_upstream_stratum();
     bp.net_flags    = BEACON_NET_FLAG_REG_OPEN;
 
-    bp.telem_flags       = BEACON_TELEM_FLAG_TX_PWR
-                         | BEACON_TELEM_FLAG_NODES
-                         | BEACON_TELEM_FLAG_UPTIME;
-    bp.tx_power_dbm      = 14;
-    bp.upstream_rssi_dbm = (int8_t)0x80;      /* no upstream (we are root)     */
-    bp.node_count        = g_node_count;
-    bp.uptime_s          = (uint32_t)((now_ms_mono - boot_mono_ms) / 1000ULL);
+    bp.telem_flags  = BEACON_TELEM_FLAG_TX_PWR
+                    | BEACON_TELEM_FLAG_NODES
+                    | BEACON_TELEM_FLAG_UPTIME;
+    bp.tx_power_dbm = 14;
+
+    if (gw_upstream_state() == GW_UP_REGISTERED) {
+        bp.telem_flags      |= BEACON_TELEM_FLAG_RSSI;
+        bp.upstream_rssi_dbm = (int8_t)gw_upstream_peer_rssi();
+    } else {
+        bp.upstream_rssi_dbm = (int8_t)0x80; /* no upstream (root)            */
+    }
+
+    bp.node_count = g_node_count;
+    bp.uptime_s   = (uint32_t)((now_ms_mono - boot_mono_ms) / 1000ULL);
 
     hdr.type    = EMESH_PACKET_TYPE_BEACON;
     hdr.flags   = EMESH_FRAME_FLAG_BROADCAST;
@@ -319,6 +377,49 @@ static void send_beacon(uint32_t my_id, uint64_t boot_mono_ms)
                gw_lora_peers_count());
     } else {
         fprintf(stderr, "[GW] Beacon TX FAILED\n");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Location advertisement TX
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void send_location_adv(uint32_t my_id)
+{
+    uint8_t              frame[EMESH_FRAME_HEADER_SIZE + LOCATION_ADV_PAYLOAD_SIZE];
+    emesh_frame_header_t hdr;
+    location_adv_t       loc;
+
+    if (!g_location.valid) {
+        return; /* no location configured — nothing to broadcast */
+    }
+
+    loc.lat_deg   = g_location.lat_deg;
+    loc.lon_deg   = g_location.lon_deg;
+    loc.alt_m     = g_location.alt_m;
+    loc.gps_valid = false;                        /* manual config, not GPS  */
+    loc.alt_valid = (g_location.alt_m != 0.0f);
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type    = EMESH_PACKET_TYPE_LOCATION_ADV;
+    hdr.flags   = EMESH_FRAME_FLAG_BROADCAST;
+    hdr.ttl     = GATEWAY_TTL;
+    hdr.src_id  = my_id;
+    hdr.dest_id = EMESH_DEST_BROADCAST;
+    hdr.seq     = ++g_resp_seq;
+    hdr.op      = EMESH_OP_MESH_LOCATION_ADV;
+    hdr.length  = LOCATION_ADV_PAYLOAD_SIZE;
+
+    emesh_frame_encode_header(&hdr, frame);
+    if (location_adv_encode(&loc, frame + EMESH_FRAME_HEADER_SIZE,
+                             LOCATION_ADV_PAYLOAD_SIZE) == 0U) {
+        return;
+    }
+
+    if (lgw_hal_transmit(frame, (uint8_t)(EMESH_FRAME_HEADER_SIZE
+                                           + LOCATION_ADV_PAYLOAD_SIZE))) {
+        printf("[GW] Location ADV TX  lat=%.6f  lon=%.6f  alt=%.1f m\n",
+               loc.lat_deg, loc.lon_deg, (double)loc.alt_m);
     }
 }
 
@@ -387,17 +488,19 @@ static void handle_subscription(uint32_t my_id,
             g_nodes[idx].last_reg      = now;
 
             /*
-             * Assign a TDMA beacon slot to relay-tier nodes; leaf nodes do
-             * not beacon and receive TDMA_NO_SLOT_ASSIGNED.
+             * Assign a TDMA beacon slot to relay- and gateway-tier nodes.
+             * alloc_relay_slot() scans current entries so slots freed by
+             * node expiry are immediately reusable.
+             * Leaf nodes do not beacon and receive TDMA_NO_SLOT_ASSIGNED.
              */
-            if ((req.capability & 0x03U) == (uint8_t)EMESH_NODE_TIER_RELAY) {
-                if (g_next_relay_slot < TDMA_MAX_BEACON_SLOTS) {
-                    g_nodes[idx].beacon_slot = g_next_relay_slot++;
+            {
+                uint8_t tier = EMESH_NODE_TIER(req.capability);
+                if (tier == EMESH_NODE_TIER_RELAY
+                    || tier == EMESH_NODE_TIER_GATEWAY) {
+                    g_nodes[idx].beacon_slot = alloc_relay_slot();
                 } else {
                     g_nodes[idx].beacon_slot = TDMA_NO_SLOT_ASSIGNED;
                 }
-            } else {
-                g_nodes[idx].beacon_slot = TDMA_NO_SLOT_ASSIGNED;
             }
 
             g_node_count++;
@@ -551,7 +654,8 @@ static void handle_data(const emesh_frame_header_t *hdr,
 static void dispatch_frame(uint32_t my_id,
                             const uint8_t *raw, uint8_t raw_len,
                             const lgw_rx_meta_t *meta,
-                            bool reg_window_open)
+                            bool reg_window_open,
+                            uint64_t now_mono)
 {
     emesh_frame_header_t hdr;
     const uint8_t       *payload;
@@ -593,66 +697,72 @@ static void dispatch_frame(uint32_t my_id,
 
             if (beacon_payload_decode(payload, payload_len, &bp)) {
 
-                /*
-                 * Determine if this beacon came from another gateway.
-                 * The sender's tier is not directly in the beacon payload, but
-                 * a gateway beacon is always:
-                 *   - a broadcast frame
-                 *   - with stratum 0 (EMESH_STRATUM_GPS) or low stratum
-                 *   - and src_id != my_id
-                 *
-                 * A more reliable check uses the op-code class (EMESH_OP_MESH_BEACON),
-                 * which every beacon carries regardless of tier.  We distinguish
-                 * gateways from relays by stratum: stratum 0 is only claimed by
-                 * gateways (relays always propagate a higher stratum).
-                 */
-                if (hdr.src_id != my_id && bp.stratum == EMESH_STRATUM_GPS) {
-                    bool is_new = false;
-                    gw_lora_peers_update(hdr.src_id,
-                                         meta->rssi_dbm,
-                                         meta->snr_db,
-                                         bp.stratum,
-                                         bp.node_count,
-                                         t2_ms,
-                                         &is_new);
-                    is_gateway_peer = true;
-
-                    if (is_new) {
-                        printf("[GW] New peer GW 0x%08X  rssi=%.0f dBm  "
-                               "snr=%.1f dB  nodes=%u  (total peers=%u)\n",
-                               hdr.src_id, meta->rssi_dbm, meta->snr_db,
-                               bp.node_count, gw_lora_peers_count());
-                    } else {
-                        printf("[GW] Peer GW    0x%08X  rssi=%.0f dBm  "
-                               "snr=%.1f dB  nodes=%u\n",
-                               hdr.src_id, meta->rssi_dbm, meta->snr_db,
-                               bp.node_count);
-                    }
+                if (hdr.src_id != my_id) {
+                    bool reg_open = (bp.net_flags & BEACON_NET_FLAG_REG_OPEN) != 0U;
 
                     /*
-                     * Collision detection: if the peer's beacon arrived within
-                     * GW_COLLISION_WINDOW_MS of our own last beacon, the two
-                     * gateways are on the same slot.  Shift our slot up by one.
+                     * Feed every foreign beacon into the upstream state machine.
+                     * The module itself filters to stratum-0 sources only.
                      */
-                    if (g_last_beacon_utc_ms > 0U
-                        && gw_lora_peers_collision(g_last_beacon_utc_ms,
-                                                    GW_COLLISION_WINDOW_MS)) {
-                        uint8_t new_slot = (uint8_t)((g_my_beacon_slot + 1U)
-                                                       % TDMA_MAX_BEACON_SLOTS);
-                        printf("[GW] BEACON COLLISION with 0x%08X — shifting "
-                               "from slot %u to slot %u\n",
-                               hdr.src_id, g_my_beacon_slot, new_slot);
-                        g_my_beacon_slot = new_slot;
+                    gw_upstream_on_beacon(hdr.src_id, bp.stratum,
+                                          meta->rssi_dbm, reg_open, now_mono);
+
+                    /*
+                     * Peer gateway table: track stratum-0 gateways for
+                     * topology logging and beacon-slot collision detection.
+                     * Only suppress collision detection when we are already
+                     * registered with an upstream (slot is managed externally).
+                     */
+                    if (bp.stratum == EMESH_STRATUM_GPS) {
+                        bool is_new = false;
+                        gw_lora_peers_update(hdr.src_id,
+                                             meta->rssi_dbm,
+                                             meta->snr_db,
+                                             bp.stratum,
+                                             bp.node_count,
+                                             t2_ms,
+                                             &is_new);
+                        is_gateway_peer = true;
+
+                        if (is_new) {
+                            printf("[GW] New peer GW 0x%08X  rssi=%.0f dBm  "
+                                   "snr=%.1f dB  nodes=%u  (total peers=%u)\n",
+                                   hdr.src_id, meta->rssi_dbm, meta->snr_db,
+                                   bp.node_count, gw_lora_peers_count());
+                        } else {
+                            printf("[GW] Peer GW    0x%08X  rssi=%.0f dBm  "
+                                   "snr=%.1f dB  nodes=%u\n",
+                                   hdr.src_id, meta->rssi_dbm, meta->snr_db,
+                                   bp.node_count);
+                        }
+
+                        /*
+                         * Collision detection: only active in STANDALONE mode.
+                         * In REGISTERED state the upstream gateway assigned our
+                         * slot, so there is no local collision to resolve.
+                         */
+                        if (gw_upstream_state() == GW_UP_STANDALONE
+                            && g_last_beacon_utc_ms > 0U
+                            && gw_lora_peers_collision(g_last_beacon_utc_ms,
+                                                        GW_COLLISION_WINDOW_MS)) {
+                            uint8_t new_slot =
+                                (uint8_t)((g_my_beacon_slot + 1U)
+                                           % TDMA_MAX_BEACON_SLOTS);
+                            printf("[GW] BEACON COLLISION with 0x%08X — "
+                                   "shifting from slot %u to slot %u\n",
+                                   hdr.src_id, g_my_beacon_slot, new_slot);
+                            g_my_beacon_slot = new_slot;
+                        }
+                    } else {
+                        /* Relay or secondary-GW beacon — informational only. */
+                        printf("[GW] RX Beacon   from 0x%08X  rssi=%.0f dBm  "
+                               "snr=%.1f dB  utc=%llu ms  stratum=%u  "
+                               "nodes=%u  uptime=%us  reg_open=%d\n",
+                               hdr.src_id, meta->rssi_dbm, meta->snr_db,
+                               (unsigned long long)bp.utc_epoch_ms,
+                               bp.stratum, bp.node_count, bp.uptime_s,
+                               reg_open ? 1 : 0);
                     }
-                } else if (hdr.src_id != my_id) {
-                    /* Relay beacon — informational only. */
-                    printf("[GW] RX Beacon   from 0x%08X  rssi=%.0f dBm  "
-                           "snr=%.1f dB  utc=%llu ms  stratum=%u  "
-                           "nodes=%u  uptime=%us  reg_open=%d\n",
-                           hdr.src_id, meta->rssi_dbm, meta->snr_db,
-                           (unsigned long long)bp.utc_epoch_ms,
-                           bp.stratum, bp.node_count, bp.uptime_s,
-                           (bp.net_flags & BEACON_NET_FLAG_REG_OPEN) ? 1 : 0);
                 }
                 (void)is_gateway_peer;
             } else if (hdr.src_id != my_id) {
@@ -684,12 +794,71 @@ static void dispatch_frame(uint32_t my_id,
         handle_data(&hdr, payload, hdr.length, meta->rssi_dbm);
         break;
 
+    case EMESH_PACKET_TYPE_REG_RESPONSE:
+        /*
+         * A REG_RESPONSE addressed to us means we registered with an upstream
+         * gateway.  Route it into the upstream state machine.
+         */
+        if (gw_upstream_state() == GW_UP_REGISTERING) {
+            reg_response_t rr;
+            if (reg_response_decode(payload, hdr.length, &rr)) {
+                gw_upstream_on_reg_response(rr.status, rr.beacon_slot,
+                                            rr.stratum, now_mono);
+            } else {
+                fprintf(stderr,
+                        "[GW] Malformed REG_RESPONSE from 0x%08X\n",
+                        hdr.src_id);
+            }
+        } else {
+            printf("[GW] RX REG_RESPONSE from 0x%08X  rssi=%.0f dBm "
+                   "(unexpected — not registering)\n",
+                   hdr.src_id, meta->rssi_dbm);
+        }
+        break;
+
+    case EMESH_PACKET_TYPE_LOCATION_ADV:
+        {
+            location_adv_t loc;
+            if (location_adv_decode(payload, hdr.length, &loc)) {
+                uint8_t nidx = node_find(hdr.src_id);
+                if (nidx < g_node_count) {
+                    /* Known registered node — store its self-reported location. */
+                    g_nodes[nidx].loc_valid  = true;
+                    g_nodes[nidx].loc_gps    = loc.gps_valid;
+                    g_nodes[nidx].lat_deg    = loc.lat_deg;
+                    g_nodes[nidx].lon_deg    = loc.lon_deg;
+                    g_nodes[nidx].alt_m      = loc.alt_m;
+                    g_nodes[nidx].loc_updated = time(NULL);
+                    printf("[GW] Location ADV from node 0x%08X  "
+                           "lat=%.6f  lon=%.6f  alt=%.1f m  %s\n",
+                           hdr.src_id, loc.lat_deg, loc.lon_deg,
+                           (double)loc.alt_m,
+                           loc.gps_valid ? "GPS" : "manual");
+                } else {
+                    /* Not a registered node — treat as peer gateway location. */
+                    gw_lora_peers_set_location(hdr.src_id,
+                                               loc.lat_deg, loc.lon_deg,
+                                               loc.alt_m, loc.gps_valid);
+                    printf("[GW] Location ADV from GW  0x%08X  "
+                           "lat=%.6f  lon=%.6f  alt=%.1f m  %s\n",
+                           hdr.src_id, loc.lat_deg, loc.lon_deg,
+                           (double)loc.alt_m,
+                           loc.gps_valid ? "GPS" : "manual");
+                }
+            } else {
+                fprintf(stderr,
+                        "[GW] Malformed LOCATION_ADV from 0x%08X\n",
+                        hdr.src_id);
+            }
+        }
+        break;
+
     case EMESH_PACKET_TYPE_ACK:
     case EMESH_PACKET_TYPE_NEIGHBOUR_ADV:
-    case EMESH_PACKET_TYPE_REG_RESPONSE:
     case EMESH_PACKET_TYPE_TIME_RESP:
-     /* Not handled at the gateway level — log only. */
-    printf("[GW] RX type=0x%02X from 0x%08X  rssi=%.0f dBm (unhandled)\n", hdr.type, hdr.src_id, meta->rssi_dbm);
+        /* Not handled at the gateway level — log only. */
+        printf("[GW] RX type=0x%02X from 0x%08X  rssi=%.0f dBm (unhandled)\n",
+               hdr.type, hdr.src_id, meta->rssi_dbm);
         break;
 
     default:
@@ -726,8 +895,14 @@ int main(int argc, char *argv[])
     uint8_t       rx_len;
     lgw_rx_meta_t rx_meta;
     bool          reg_window_open;
+    bool                gw_ready;            /* true once upstream SM is REGISTERED or STANDALONE */
+    uint64_t            last_loc_adv_mono_ms; /* monotonic ms of last LOCATION_ADV TX */
+    gw_upstream_state_t prev_upstream_state;  /* detect STANDALONE→REGISTERED transition */
     const char   *slot_env;
     int           i;
+
+    /* Unbuffered stdout so logs appear immediately even when piped to a file. */
+    setbuf(stdout, NULL);
 
     /* ── Signal handlers ─────────────────────────────────────────────────── */
     signal(SIGINT,  sig_handler);
@@ -740,11 +915,8 @@ int main(int argc, char *argv[])
      *   2. EUROMESH_BEACON_SLOT environment variable
      *   3. Random slot chosen at startup (default)
      *
-     * Random selection prevents two gateways that boot simultaneously from
-     * both landing on slot 0 before the collision-detection logic can run.
-     * They would be transmitting at the same instant and therefore unable to
-     * hear each other's beacon, so the collision would never be detected.
-     * Picking a random slot at startup avoids that race entirely.
+     * When the upstream SM assigns a slot (REGISTERED state), that takes
+     * precedence and overrides whatever was set here.
      */
     srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
     g_my_beacon_slot = (uint8_t)((unsigned int)rand() % TDMA_MAX_BEACON_SLOTS);
@@ -772,13 +944,30 @@ int main(int argc, char *argv[])
                         s, (unsigned int)(TDMA_MAX_BEACON_SLOTS - 1U));
             }
             i++;
+        } else if (strcmp(argv[i], "--lat") == 0 && i + 1 < argc) {
+            g_location.lat_deg = atof(argv[i + 1]);
+            g_location.valid   = true;
+            i++;
+        } else if (strcmp(argv[i], "--lon") == 0 && i + 1 < argc) {
+            g_location.lon_deg = atof(argv[i + 1]);
+            g_location.valid   = true;
+            i++;
+        } else if (strcmp(argv[i], "--alt") == 0 && i + 1 < argc) {
+            g_location.alt_m = (float)atof(argv[i + 1]);
+            i++;
         }
     }
 
     /* ── Node ID ─────────────────────────────────────────────────────────── */
     my_id = emesh_get_node_id();
-    printf("[GW] EuroMesh Gateway  id=0x%08X  cap=0x%02X  beacon_slot=%u\n",
-           my_id, GATEWAY_CAPABILITY, g_my_beacon_slot);
+    printf("[GW] EuroMesh Gateway  id=0x%08X  cap=0x%02X\n",
+           my_id, GATEWAY_CAPABILITY);
+
+    if (g_location.valid) {
+        printf("[GW] Location: lat=%.6f  lon=%.6f  alt=%.1f m\n",
+               g_location.lat_deg, g_location.lon_deg,
+               (double)g_location.alt_m);
+    }
 
     /* ── Peer table ──────────────────────────────────────────────────────── */
     gw_lora_peers_init();
@@ -789,27 +978,95 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* ── Upstream registration state machine ─────────────────────────────── */
+    uint64_t boot_mono_ms = mono_now_ms();
+    gw_upstream_init(my_id, GATEWAY_CAPABILITY, boot_mono_ms);
+
     /* ── Main loop ───────────────────────────────────────────────────────── */
     /*
-     * Beacon timing is UTC-aligned:
-     *   next_beacon_ms = next multiple of BEACON_INTERVAL_S seconds in UTC
-     *                    + g_my_beacon_slot * TDMA_SLOT_MS
+     * Beaconing does not begin until the upstream state machine reaches
+     * REGISTERED or STANDALONE.  Until then the gateway listens, feeds
+     * beacons into the upstream SM, and sends SUBSCRIPTION frames as directed.
      *
-     * Setting next_beacon_ms = 0 forces an immediate beacon on the first
-     * iteration, then subsequent beacons align to epoch boundaries.
+     * Once ready, next_beacon_ms is set to the next UTC-aligned slot and the
+     * normal beacon cycle begins.
      */
-    next_beacon_ms     = 0U;
-    reg_close_utc_ms   = 0U;
-    last_expiry_ms     = mono_now_ms();
-    last_peer_log_ms   = mono_now_ms();
-    uint64_t boot_mono_ms = mono_now_ms();
+    next_beacon_ms       = UINT64_MAX; /* sentinel: do not beacon until ready */
+    reg_close_utc_ms     = 0U;
+    last_expiry_ms       = boot_mono_ms;
+    last_peer_log_ms     = boot_mono_ms;
+    last_loc_adv_mono_ms = 0U;         /* 0 → fire on first ready iteration  */
+    gw_ready             = false;
+    prev_upstream_state  = GW_UP_SCANNING;
 
     while (g_running) {
         uint64_t now_utc  = utc_now_ms();
         uint64_t now_mono = mono_now_ms();
 
+        /* ── Upstream state machine tick ─────────────────────────────────── */
+        if (gw_upstream_tick(now_mono)) {
+            /* Upstream SM wants us to send a SUBSCRIPTION. */
+            uint8_t sub_buf[EMESH_FRAME_HEADER_SIZE + SUB_REQUEST_PAYLOAD_SIZE];
+            uint8_t sub_len = gw_upstream_sub_frame(sub_buf, sizeof(sub_buf),
+                                                     ++g_resp_seq);
+            if (sub_len > 0U) {
+                if (lgw_hal_transmit(sub_buf, sub_len)) {
+                    gw_upstream_sub_sent(now_mono);
+                } else {
+                    fprintf(stderr, "[GW] SUBSCRIPTION TX failed\n");
+                }
+            }
+        }
+
+        /* ── Transition to ready / slot update ──────────────────────────── */
+        {
+            gw_upstream_state_t cur = gw_upstream_state();
+
+            if (!gw_ready && gw_upstream_is_ready()) {
+                gw_ready = true;
+
+                if (cur == GW_UP_REGISTERED) {
+                    uint8_t up_slot = gw_upstream_slot();
+                    if (up_slot != TDMA_NO_SLOT_ASSIGNED) {
+                        g_my_beacon_slot = up_slot;
+                    }
+                    /* else: upstream ran out of slots — keep our local slot */
+                }
+
+                printf("[GW] Ready: upstream=%s  slot=%u  stratum=%u\n",
+                       gw_upstream_state_name(),
+                       g_my_beacon_slot,
+                       gw_upstream_stratum());
+
+                next_beacon_ms = next_beacon_utc_ms(g_my_beacon_slot);
+
+            } else if (gw_ready
+                       && cur == GW_UP_REGISTERED
+                       && prev_upstream_state != GW_UP_REGISTERED) {
+                /*
+                 * Transitioned into REGISTERED after already beaconing
+                 * (e.g., was STANDALONE, yielded to a lower-ID gateway).
+                 * Update our beacon slot to the one assigned by upstream.
+                 */
+                uint8_t up_slot = gw_upstream_slot();
+                if (up_slot != TDMA_NO_SLOT_ASSIGNED
+                    && up_slot != g_my_beacon_slot) {
+                    printf("[GW] Slot updated %u → %u after upstream registration\n",
+                           g_my_beacon_slot, up_slot);
+                    g_my_beacon_slot = up_slot;
+                    next_beacon_ms   = next_beacon_utc_ms(g_my_beacon_slot);
+                }
+                printf("[GW] Now registered: upstream=%s  slot=%u  stratum=%u\n",
+                       gw_upstream_state_name(),
+                       g_my_beacon_slot,
+                       gw_upstream_stratum());
+            }
+
+            prev_upstream_state = cur;
+        }
+
         /* ── Beacon window (UTC-aligned slot) ────────────────────────────── */
-        if (now_utc >= next_beacon_ms) {
+        if (gw_ready && now_utc >= next_beacon_ms) {
             node_expire();
             send_beacon(my_id, boot_mono_ms);
 
@@ -822,23 +1079,31 @@ int main(int argc, char *argv[])
             last_expiry_ms = now_mono;
         }
 
-        /* Registration window state. */
-        reg_window_open = (now_utc < reg_close_utc_ms);
+        /* Registration window is only open once we are beaconing. */
+        reg_window_open = gw_ready && (now_utc < reg_close_utc_ms);
 
         /* ── RX poll ─────────────────────────────────────────────────────── */
         rx_len = 0U;
         if (lgw_hal_receive(rx_buf, (uint16_t)sizeof(rx_buf),
                             &rx_len, &rx_meta)) {
-            dispatch_frame(my_id, rx_buf, rx_len, &rx_meta, reg_window_open);
+            dispatch_frame(my_id, rx_buf, rx_len, &rx_meta,
+                           reg_window_open, now_mono);
         } else {
             (void)usleep(RX_POLL_INTERVAL_US);
         }
 
-        /* ── Periodic expiry (every minute) ──────────────────────────────── */
-        if ((now_mono - last_expiry_ms) >= 60000U) {
+        /* ── Periodic expiry (every minute, only once beaconing) ─────────── */
+        if (gw_ready && (now_mono - last_expiry_ms) >= 60000U) {
             node_expire();
             gw_lora_peers_expire((time_t)GW_PEER_TIMEOUT_S);
             last_expiry_ms = now_mono;
+        }
+
+        /* ── Location ADV (on first beacon and every 5 minutes) ─────────── */
+        if (gw_ready && g_location.valid
+            && (now_mono - last_loc_adv_mono_ms) >= 300000U) {
+            send_location_adv(my_id);
+            last_loc_adv_mono_ms = now_mono;
         }
 
         /* ── Periodic peer table log (every 5 minutes) ───────────────────── */

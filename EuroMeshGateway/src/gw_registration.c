@@ -23,6 +23,22 @@ bool sub_request_decode(const uint8_t *buf, uint8_t length, sub_request_t *out)
     return true;
 }
 
+bool reg_response_decode(const uint8_t *buf, uint8_t length, reg_response_t *out)
+{
+    if (buf == NULL || out == NULL || length < REG_RESPONSE_PAYLOAD_SIZE) {
+        return false;
+    }
+    if (buf[0] != EMESH_PACKET_TYPE_REG_RESPONSE) {
+        return false;
+    }
+    out->status             = buf[1];
+    out->pan_id             = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+    out->stratum            = buf[4];
+    out->nb_adv_interval_s  = buf[5];
+    out->beacon_slot        = buf[6];
+    return true;
+}
+
 uint8_t reg_response_encode(const reg_response_t *resp,
                              uint8_t *buf, uint8_t capacity)
 {
