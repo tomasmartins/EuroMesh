@@ -16,6 +16,10 @@
 CC      ?= gcc
 AR      ?= ar
 
+# ── Default target (must appear before any other rule) ────────────────────
+.PHONY: all clean install
+all: $(LGW_LIB) $(TARGET) $(TEST_SX1301)
+
 # ── libloragw (bundled Semtech HAL) ───────────────────────────────────────
 LGW_DIR   := libloragw
 LGW_INC   := $(LGW_DIR)/inc
@@ -96,11 +100,6 @@ TEST_SX1301      := tools/test_sx1301
 TEST_SX1301_SRCS := tools/test_sx1301.c  \
                     src/lgw_hal.c
 TEST_SX1301_OBJS := $(TEST_SX1301_SRCS:.c=.o)
-
-# ── Default target ────────────────────────────────────────────────────────
-.PHONY: all clean install
-
-all: $(LGW_LIB) $(TARGET) $(TEST_SX1301)
 
 $(TARGET): $(OBJS) $(LGW_LIB)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
