@@ -55,6 +55,7 @@
 #include "emesh_frame.h"
 #include "emesh_node_caps.h"
 #include "emesh_packet_types.h"
+#include "emesh_telemetry.h"
 #include "gw_lora_peers.h"
 #include "gw_registration.h"
 #include "gw_upstream.h"
@@ -157,6 +158,12 @@ typedef struct {
     double   lon_deg;
     float    alt_m;
     time_t   loc_updated;
+    /* Last received telemetry (zeroed until first TELEMETRY DATA frame). */
+    bool     telem_valid;
+    uint8_t  telem_flags;
+    uint16_t telem_batt_mv;
+    int16_t  telem_temp_cdeg;
+    time_t   telem_updated;
 } gw_node_entry_t;
 
 static gw_node_entry_t g_nodes[REG_MAX_NODES];
@@ -614,36 +621,69 @@ static void handle_data(const emesh_frame_header_t *hdr,
                         const uint8_t *payload, uint8_t payload_len,
                         float rssi_dbm)
 {
-    uint8_t i;
-    bool    is_text = true;
+    uint8_t  op_class = (uint8_t)(hdr->op >> 8);
 
     printf("[GW] DATA from 0x%08X  rssi=%.0f dBm"
            "  op=0x%04X  seq=%u  len=%u\n",
            hdr->src_id, rssi_dbm, hdr->op, hdr->seq, payload_len);
+
+    if (op_class == EMESH_OP_CLASS_TELEMETRY) {
+        emesh_telemetry_t t;
+        if (!emesh_telemetry_decode(payload, payload_len, &t)) {
+            fprintf(stderr, "[GW]   TELEMETRY payload too short (%u bytes)\n",
+                    payload_len);
+            return;
+        }
+
+        /* Update node table if the sender is registered. */
+        uint8_t nidx = node_find(hdr->src_id);
+        if (nidx < g_node_count) {
+            g_nodes[nidx].telem_valid    = true;
+            g_nodes[nidx].telem_flags    = t.flags;
+            g_nodes[nidx].telem_batt_mv  = t.batt_mv;
+            g_nodes[nidx].telem_temp_cdeg = t.temp_cdeg;
+            g_nodes[nidx].telem_updated  = time(NULL);
+        }
+
+        printf("[GW]   TELEMETRY:");
+        if (t.flags & EMESH_TELEM_FLAG_BATT) {
+            printf("  batt=%u mV (%.2fV)%s",
+                   t.batt_mv, (double)t.batt_mv / 1000.0,
+                   (t.flags & EMESH_TELEM_FLAG_CHARGING) ? " CHG" : "");
+        }
+        if (t.flags & EMESH_TELEM_FLAG_TEMP) {
+            printf("  temp=%.2f C", (double)t.temp_cdeg / 100.0);
+        }
+        printf("\n");
+        return;
+    }
 
     if (payload_len == 0U) {
         printf("[GW]   (empty payload)\n");
         return;
     }
 
-    /* Detect printable ASCII (allow trailing NUL). */
-    for (i = 0U; i < payload_len; i++) {
-        uint8_t c = payload[i];
-        if (c == 0U && i == (uint8_t)(payload_len - 1U)) break; /* trailing NUL */
-        if (c < 0x20U || c > 0x7EU) { is_text = false; break; }
-    }
-
-    if (is_text) {
-        /* Safe to print as string (NUL-terminate defensively). */
-        char tmp[256];
-        uint8_t copy_len = payload_len < 255U ? payload_len : 255U;
-        memcpy(tmp, payload, copy_len);
-        tmp[copy_len] = '\0';
-        printf("[GW]   payload: \"%s\"\n", tmp);
-    } else {
-        printf("[GW]   payload hex:");
-        for (i = 0U; i < payload_len; i++) printf(" %02X", payload[i]);
-        printf("\n");
+    /* For non-telemetry DATA frames: detect printable ASCII. */
+    {
+        uint8_t i;
+        bool    is_text = true;
+        for (i = 0U; i < payload_len; i++) {
+            uint8_t c = payload[i];
+            if (c == 0U && i == (uint8_t)(payload_len - 1U)) break;
+            if (c < 0x20U || c > 0x7EU) { is_text = false; break; }
+        }
+        if (is_text) {
+            char tmp[256];
+            uint8_t copy_len = payload_len < 255U ? payload_len : 255U;
+            memcpy(tmp, payload, copy_len);
+            tmp[copy_len] = '\0';
+            printf("[GW]   payload: \"%s\"\n", tmp);
+        } else {
+            uint8_t i2;
+            printf("[GW]   payload hex:");
+            for (i2 = 0U; i2 < payload_len; i2++) printf(" %02X", payload[i2]);
+            printf("\n");
+        }
     }
 }
 

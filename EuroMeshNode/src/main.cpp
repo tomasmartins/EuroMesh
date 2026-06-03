@@ -38,6 +38,11 @@
 #define PMU_SDA    10
 #define PMU_SCL    11
 
+// ── Touch/Haptic I2C (CST816 + DRV2605) ──────────────────────────────────
+#define TOUCH_SDA  39
+#define TOUCH_SCL  40
+#define TOUCH_INT  16
+
 // ── SX1262 LoRa pins ──────────────────────────────────────────────────────
 static constexpr int LORA_SCK  = 3;
 static constexpr int LORA_MISO = 4;
@@ -46,7 +51,7 @@ static constexpr int LORA_NSS  = 5;
 static constexpr int LORA_RST  = 8;
 static constexpr int LORA_DIO1 = 9;
 static constexpr int LORA_BUSY = 7;
-static constexpr uint8_t TOUCH_I2C_ADDR = 0x15; // CST816S/CST816T (T-Watch-S3)
+static constexpr uint8_t TOUCH_I2C_ADDR = 0x38; // FT6336U (T-Watch-S3)
 static constexpr uint8_t DRV2605_I2C_ADDR = 0x5A;
 
 // ── Radio parameters ──────────────────────────────────────────────────────
@@ -56,21 +61,30 @@ static constexpr uint8_t  SF            = 7;
 static constexpr uint8_t  CR            = 5;       // 4/5 → RadioLib value 5
 static constexpr uint8_t  SYNC_WORD     = 0x12;    // private LoRa (non-LoRaWAN)
 static constexpr uint16_t PREAMBLE_SYMS = 8;
-static constexpr float    TCXO_V        = 1.8f;    // TCXO supply on DIO3
-static constexpr int8_t   TX_POWER_DBM  = 10;
+static constexpr float    TCXO_V        = 3.0f;    // LilyGo SX1262 examples use 3.0V
+static constexpr int8_t   TX_POWER_DBM  = 14;
+static constexpr float    CURRENT_LIMIT_MA = 140.0f;
 
 // ── TX behaviour ──────────────────────────────────────────────────────────
 // Send a test DATA packet this often (seconds after last TX / startup).
 static constexpr uint32_t TX_INTERVAL_S = 30U;
 
 // ── EuroMesh wire constants ───────────────────────────────────────────────
-#define EMESH_TYPE_BEACON    0x01U
-#define EMESH_TYPE_DATA      0x04U
-#define EMESH_HEADER_SIZE    16U
-#define BEACON_PAYLOAD_MIN   16U
-#define BEACON_PAYLOAD_FULL  24U
-#define EMESH_DEST_BROADCAST 0xFFFFFFFFUL
-#define EMESH_FLAG_BROADCAST 0x20U
+#define EMESH_TYPE_BEACON       0x01U
+#define EMESH_TYPE_DATA         0x04U
+#define EMESH_HEADER_SIZE       16U
+#define BEACON_PAYLOAD_MIN      16U
+#define BEACON_PAYLOAD_FULL     24U
+#define EMESH_DEST_BROADCAST    0xFFFFFFFFUL
+#define EMESH_FLAG_BROADCAST    0x20U
+
+// ── Telemetry op: class=0x01 (TELEMETRY), cmd=0x01 → op LE = [0x01, 0x01] ──
+#define TELEM_OP_CMD            0x01U
+#define TELEM_OP_CLASS          0x01U
+#define TELEM_PAYLOAD_SIZE      5U
+#define TELEM_FLAG_BATT         0x01U
+#define TELEM_FLAG_CHARGING     0x02U
+#define TELEM_FLAG_TEMP         0x04U
 
 // ── RGB565 palette ────────────────────────────────────────────────────────
 #define CLR_BG      0x0010U   // very dark blue
@@ -89,6 +103,7 @@ SPIClass         loraSPI(HSPI);
 SX1262           radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
 Adafruit_ST7789  tft(&SPI, TFT_CS, TFT_DC, /*rst=*/-1);
 XPowersAXP2101   pmu;
+TwoWire          touchWire = TwoWire(1);
 bool             pmuOk = false;
 
 // ── Node identity (derived from ESP32-S3 eFuse MAC) ───────────────────────
@@ -111,6 +126,8 @@ static uint8_t  lowBattHits   = 0;  // debounce for low-battery sleep
 static bool     subscribed    = false;
 static uint32_t lastTouchMs   = 0;
 static bool     hapticOk      = false;
+static bool     touchOk       = false;
+static volatile bool txDoneFlag = false;
 
 struct TouchPoint {
     bool     pressed;
@@ -305,21 +322,26 @@ static bool insideRect(uint16_t x, uint16_t y, const Rect &r) {
            (y >= (uint16_t)r.y) && (y < (uint16_t)(r.y + r.h));
 }
 
-static bool i2cReadReg(uint8_t addr, uint8_t reg, uint8_t *dst, uint8_t len) {
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    uint8_t n = Wire.requestFrom((int)addr, (int)len);
+static bool i2cPing(TwoWire &bus, uint8_t addr) {
+    bus.beginTransmission(addr);
+    return bus.endTransmission() == 0;
+}
+
+static bool i2cReadReg(TwoWire &bus, uint8_t addr, uint8_t reg, uint8_t *dst, uint8_t len) {
+    bus.beginTransmission(addr);
+    bus.write(reg);
+    if (bus.endTransmission(false) != 0) return false;
+    uint8_t n = bus.requestFrom((int)addr, (int)len);
     if (n != len) return false;
-    for (uint8_t i = 0; i < len; ++i) dst[i] = Wire.read();
+    for (uint8_t i = 0; i < len; ++i) dst[i] = bus.read();
     return true;
 }
 
-static bool i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    Wire.write(value);
-    return Wire.endTransmission() == 0;
+static bool i2cWriteReg(TwoWire &bus, uint8_t addr, uint8_t reg, uint8_t value) {
+    bus.beginTransmission(addr);
+    bus.write(reg);
+    bus.write(value);
+    return bus.endTransmission() == 0;
 }
 
 static bool initDrv2605() {
@@ -327,30 +349,30 @@ static bool initDrv2605() {
     // Register map:
     // 0x01 MODE, 0x02 RTP_INPUT, 0x03 LIB_SEL, 0x04.. WAVESEQ, 0x0C GO.
     bool ok = true;
-    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x01, 0x00); // MODE: internal trigger
-    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x02, 0x00); // RTP_INPUT: unused
-    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x03, 0x01); // LIB_SEL: library 1
-    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x1A, 0xB6); // FEEDBACK: ERM defaults
-    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x04, 0x47); // Waveform slot #1
-    ok &= i2cWriteReg(DRV2605_I2C_ADDR, 0x05, 0x00); // End of sequence
+    ok &= i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x01, 0x00); // MODE: internal trigger
+    ok &= i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x02, 0x00); // RTP_INPUT: unused
+    ok &= i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x03, 0x01); // LIB_SEL: library 1
+    ok &= i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x1A, 0xB6); // FEEDBACK: ERM defaults
+    ok &= i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x04, 0x47); // Waveform slot #1
+    ok &= i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x05, 0x00); // End of sequence
     return ok;
 }
 
 static void hapticPulse() {
     if (!hapticOk) return;
     // GO register: 1 starts playback of configured waveform.
-    i2cWriteReg(DRV2605_I2C_ADDR, 0x0C, 0x01);
+    i2cWriteReg(Wire, DRV2605_I2C_ADDR, 0x0C, 0x01);
 }
 
 static TouchPoint readTouchPoint() {
     // CST816: reg 0x02 = number of touch points, 0x03..0x06 = XH, XL, YH, YL
     uint8_t pcount = 0;
-    if (!i2cReadReg(TOUCH_I2C_ADDR, 0x02, &pcount, 1) || pcount == 0) {
+    if (!i2cReadReg(touchWire, TOUCH_I2C_ADDR, 0x02, &pcount, 1) || pcount == 0) {
         return {false, 0, 0};
     }
 
     uint8_t xy[4];
-    if (!i2cReadReg(TOUCH_I2C_ADDR, 0x03, xy, 4)) {
+    if (!i2cReadReg(touchWire, TOUCH_I2C_ADDR, 0x03, xy, 4)) {
         return {false, 0, 0};
     }
 
@@ -366,7 +388,17 @@ static TouchPoint readTouchPoint() {
     return {true, x, y};
 }
 
+static bool waitRadioReady(uint32_t timeoutMs);
+static void setTxDoneFlag(void);
+
 static bool startReceiveSafe() {
+    if (!waitRadioReady(50)) {
+        Serial.println("[Radio] BUSY timeout before startReceive");
+        return false;
+    }
+    // Ensure we re-enter RX from a clean state.
+    (void)radio.standby();
+    (void)radio.clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL);
     radio.invertIQ(false);  // keep gateway-matching IQ mode
     int16_t err = radio.startReceive();
     if (err != RADIOLIB_ERR_NONE) {
@@ -377,46 +409,131 @@ static bool startReceiveSafe() {
     return true;
 }
 
-// ── Build and transmit a test DATA frame ──────────────────────────────────
-static void sendTestPacket() {
-    // ── Build the 16-byte EuroMesh header ──────────────────────────────
-    char     text[32];
-    snprintf(text, sizeof(text), "EMNODE:%08X:SEQ:%u",
-             (unsigned)NODE_ID, (unsigned)(txSeq + 1));
-    uint8_t  pld_len = (uint8_t)strlen(text) + 1;  // include NUL
+static inline bool rxPacketPending() {
+    // SPI-poll radio IRQ flags instead of relying on GPIO edge timing.
+    int16_t rxDone = radio.checkIrq(RADIOLIB_IRQ_RX_DONE);
+    return rxDone == 1;
+}
 
-    uint8_t  frame[EMESH_HEADER_SIZE + 32];
+static bool waitRadioReady(uint32_t timeoutMs) {
+    uint32_t start = millis();
+    while (digitalRead(LORA_BUSY) == HIGH) {
+        if ((millis() - start) > timeoutMs) return false;
+        delay(1);
+    }
+    return true;
+}
+
+static void setTxDoneFlag(void) {
+    txDoneFlag = true;
+}
+
+static bool recoverRadio(const char *reason) {
+    Serial.printf("[Radio] Recovering (%s)\n", reason);
+
+    int16_t err = radio.reset();
+    if (err != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Radio] reset() failed: %d\n", err);
+        return false;
+    }
+
+    err = radio.begin(FREQ_MHZ, BW_KHZ, SF, CR, SYNC_WORD,
+                      TX_POWER_DBM, PREAMBLE_SYMS, TCXO_V);
+    if (err != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Radio] re-begin failed: %d\n", err);
+        return false;
+    }
+
+    radio.invertIQ(false);
+    return startReceiveSafe();
+}
+
+// ── Build and transmit a telemetry DATA frame ─────────────────────────────
+static void sendTelemetryPacket() {
+    // ── Read sensors ────────────────────────────────────────────────────
+    uint8_t  tflags   = 0U;
+    uint16_t batt_mv  = 0U;
+    int16_t  temp_cd  = 0;
+
+    if (pmuOk) {
+        batt_mv  = (uint16_t)pmu.getBattVoltage();  // already in mV
+        tflags  |= TELEM_FLAG_BATT;
+        if (pmu.isCharging()) tflags |= TELEM_FLAG_CHARGING;
+    }
+
+    // ESP32-S3 internal die temperature (rough; ~10-30°C above ambient)
+    float die_c = temperatureRead();
+    if (!isnan(die_c)) {
+        temp_cd  = (int16_t)(die_c * 100.0f);
+        tflags  |= TELEM_FLAG_TEMP;
+    }
+
+    // ── Build 5-byte telemetry payload ───────────────────────────────
+    uint8_t payload[TELEM_PAYLOAD_SIZE];
+    payload[0] = tflags;
+    payload[1] = (uint8_t)(batt_mv);
+    payload[2] = (uint8_t)(batt_mv >> 8);
+    payload[3] = (uint8_t)((uint16_t)temp_cd);
+    payload[4] = (uint8_t)((uint16_t)temp_cd >> 8);
+
+    // ── Build the 16-byte EuroMesh header ────────────────────────────
+    uint8_t  frame[EMESH_HEADER_SIZE + TELEM_PAYLOAD_SIZE];
     memset(frame, 0, sizeof(frame));
 
-    frame[0]  = EMESH_TYPE_DATA;          // type
-    frame[1]  = EMESH_FLAG_BROADCAST;     // flags — no ACK expected
-    frame[2]  = 7;                        // TTL
-    put_u32le(frame + 3,  NODE_ID);       // src_id
-    put_u32le(frame + 7,  EMESH_DEST_BROADCAST); // dest_id = broadcast
-    put_u16le(frame + 11, ++txSeq);       // seq
-    // op = 0xFF01 (custom class, command 0x01)
-    frame[13] = 0x01; frame[14] = 0xFF;   // op little-endian
-    frame[15] = pld_len;                  // payload length
-    memcpy(frame + EMESH_HEADER_SIZE, text, pld_len);
+    frame[0]  = EMESH_TYPE_DATA;
+    frame[1]  = EMESH_FLAG_BROADCAST;
+    frame[2]  = 7;
+    put_u32le(frame + 3,  NODE_ID);
+    put_u32le(frame + 7,  EMESH_DEST_BROADCAST);
+    put_u16le(frame + 11, ++txSeq);
+    frame[13] = TELEM_OP_CMD;    // op low byte  (command)
+    frame[14] = TELEM_OP_CLASS;  // op high byte (class = TELEMETRY)
+    frame[15] = TELEM_PAYLOAD_SIZE;
+    memcpy(frame + EMESH_HEADER_SIZE, payload, TELEM_PAYLOAD_SIZE);
 
-    uint8_t total = EMESH_HEADER_SIZE + pld_len;
+    uint8_t total = EMESH_HEADER_SIZE + TELEM_PAYLOAD_SIZE;
 
-    // ── Stop RX, transmit, restart RX ─────────────────────────────────
+    // ── Stop RX, transmit, restart RX ──────────────────────────────────
     radioMode = RadioMode::TX;
-    radio.standby();
+    int16_t err = RADIOLIB_ERR_NONE;
+    if (!waitRadioReady(80)) {
+        err = RADIOLIB_ERR_SPI_CMD_TIMEOUT;
+    } else {
+        txDoneFlag = false;
+        err = radio.startTransmit(frame, total);
+        if (err == RADIOLIB_ERR_NONE) {
+            // Give enough margin over ToA for callback/IRQ latency.
+            uint32_t txTimeoutMs = (uint32_t)((radio.getTimeOnAir(total) * 3UL) / 1000UL) + 80UL;
+            uint32_t t0 = millis();
+            while (!txDoneFlag && (millis() - t0) < txTimeoutMs) {
+                delay(1);
+            }
+            if (!txDoneFlag) {
+                err = RADIOLIB_ERR_TX_TIMEOUT;
+            }
+            int16_t fin = radio.finishTransmit();
+            if (err == RADIOLIB_ERR_NONE && fin != RADIOLIB_ERR_NONE) {
+                err = fin;
+            }
+        }
+    }
 
-    int16_t err = radio.transmit(frame, total);
     lastTxMs = millis();
     txCount++;
 
-    // Re-enter continuous RX after TX
-    startReceiveSafe();
-
     if (err == RADIOLIB_ERR_NONE) {
-        Serial.printf("[TX] DATA  src=0x%08X  seq=%u  payload=\"%s\"\n",
-                      (unsigned)NODE_ID, txSeq, text);
+        delay(2); // let SX1262 settle between TX and RX mode switches
+        // Re-enter continuous RX after successful TX
+        if (!startReceiveSafe()) {
+            (void)recoverRadio("startReceive after TX");
+        }
+        Serial.printf("[TX] TELEMETRY src=0x%08X  seq=%u"
+                      "  batt=%u mV  temp=%.2f C\n",
+                      (unsigned)NODE_ID, txSeq,
+                      batt_mv, (double)temp_cd / 100.0);
     } else {
         Serial.printf("[TX] ERROR %d\n", err);
+        (void)recoverRadio("TX error");
     }
 
     drawTxBar();
@@ -542,12 +659,33 @@ void setup() {
     Wire.begin(PMU_SDA, PMU_SCL);
     pmuOk = pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
     Serial.printf("[PMU] AXP2101 %s\n", pmuOk ? "OK" : "not found");
+    if (pmuOk) {
+        // Match LilyGo PMU power rails required for stable LoRa TX on T-Watch-S3.
+        pmu.setALDO3Voltage(3300);  // display/touch rail
+        pmu.setALDO4Voltage(3300);  // LoRa rail
+        pmu.enableALDO3();
+        pmu.enableALDO4();
+        pmu.setBLDO2Voltage(3300);  // DRV2605 enable rail
+        pmu.enableBLDO2();
+        delay(20);
+        Serial.println("[PMU] Rails: ALDO3/ALDO4/BLDO2 enabled @3.3V");
+    }
+
+    // Touch + haptic share a dedicated I2C bus on T-Watch-S3
+    pinMode(TOUCH_INT, INPUT_PULLUP);
+    touchWire.begin(TOUCH_SDA, TOUCH_SCL, 400000U);
+    touchOk = i2cPing(touchWire, TOUCH_I2C_ADDR);
+    Serial.printf("[TOUCH] FT6336U %s @0x%02X on SDA=%d SCL=%d INT=%d\n",
+                  touchOk ? "OK" : "not found",
+                  TOUCH_I2C_ADDR, TOUCH_SDA, TOUCH_SCL, TOUCH_INT);
     hapticOk = initDrv2605();
     Serial.printf("[HAPTIC] DRV2605 %s (0x%02X)\n",
                   hapticOk ? "OK" : "init failed", DRV2605_I2C_ADDR);
 
     // LoRa (HSPI / SPI3)
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+    pinMode(LORA_DIO1, INPUT);
+    pinMode(LORA_BUSY, INPUT);
 
     Serial.print("[Radio] Init SX1262... ");
     int16_t err = radio.begin(FREQ_MHZ, BW_KHZ, SF, CR, SYNC_WORD,
@@ -565,6 +703,22 @@ void setup() {
         while (true) delay(1000);
     }
     Serial.println("OK");
+    // Match LilyGo reference examples for SX1262 stability on T-Watch-S3.
+    err = radio.setTCXO(TCXO_V);
+    if (err != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Radio] setTCXO(%.1fV) failed: %d\n", TCXO_V, err);
+    }
+    err = radio.setDio2AsRfSwitch();
+    if (err != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Radio] setDio2AsRfSwitch failed: %d\n", err);
+    }
+    err = radio.setCurrentLimit(CURRENT_LIMIT_MA);
+    if (err != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Radio] setCurrentLimit(%.0fmA) failed: %d\n", CURRENT_LIMIT_MA, err);
+    }
+
+    radio.setPacketSentAction(setTxDoneFlag);
+
     Serial.printf("[Node] ID=0x%08X\n", (unsigned)NODE_ID);
     Serial.printf("[Radio] %.3f MHz  SF%d  BW%.0f kHz  CR4/%d  SW=0x%02X\n",
                   FREQ_MHZ, SF, BW_KHZ, CR, SYNC_WORD);
@@ -590,7 +744,7 @@ void loop() {
     uint32_t now = millis();
 
     // ── Touchscreen JOIN button ─────────────────────────────────────────
-    if (!subscribed && (now - lastTouchMs) > 60u) {
+    if (!subscribed && touchOk && (now - lastTouchMs) > 60u) {
         lastTouchMs = now;
         TouchPoint tp = readTouchPoint();
         if (tp.pressed && insideRect(tp.x, tp.y, SUBSCRIBE_BTN)) {
@@ -647,13 +801,15 @@ void loop() {
     // ── Periodic TX ──────────────────────────────────────────────────────
     if (subscribed && radioMode != RadioMode::SLEEP &&
         (now - lastTxMs) >= TX_INTERVAL_S * 1000u) {
-        sendTestPacket();
+        sendTelemetryPacket();
     }
 
-    // ── RX poll (no interrupt needed — polled via SPI) ────────────────────
-    if (radioMode == RadioMode::RX && radio.available()) {
+    // ── RX poll (no interrupt handler; poll DIO1 packet-ready line) ───────
+    if (radioMode == RadioMode::RX && rxPacketPending()) {
         handlePacket();
         // Always restart receive after reading (in case it didn't auto-restart)
-        startReceiveSafe();
+        if (!startReceiveSafe()) {
+            (void)recoverRadio("startReceive after RX");
+        }
     }
 }
